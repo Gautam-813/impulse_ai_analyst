@@ -12,7 +12,7 @@ scikit-learn
 scipy
 pygwalker
 streamlit-aggrid
-pandas-ta
+pandas-ta-remake
 statsmodels
 QuantStats
 duckdb
