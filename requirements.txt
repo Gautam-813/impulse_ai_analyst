@@ -12,9 +12,10 @@ scikit-learn
 scipy
 pygwalker
 streamlit-aggrid
-pandas-ta-remake
+pandas-ta
 statsmodels
 QuantStats
 duckdb
 polars
 altair
+xgboost

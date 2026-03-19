@@ -1,401 +1,315 @@
 ﻿//+------------------------------------------------------------------+
-//|                 MA Crossover Impulse Data Collector              |
-//|                 Logs impulse in points and percent               |
-//|                 This EA does NOT trade                           |
+//|                                           MA_impulse_logged.mq5 |
+//|                                  Copyright 2026, Antigravity     |
 //+------------------------------------------------------------------+
+#property copyright   "Copyright 2026, Antigravity"
+#property link        "https://google.com"
+#property version     "1.03"
 #property strict
-#property copyright "You"
-#property version   "1.00"
 
-//--- inputs
+//--- input parameters
 input ENUM_MA_METHOD      InpMAMethod          = MODE_SMA;
 input int                 InpMAPeriod          = 50;
 input ENUM_APPLIED_PRICE  InpPrice             = PRICE_CLOSE;
 input int                 InpMAShift           = 0;
 input ENUM_TIMEFRAMES     InpTimeframe         = PERIOD_CURRENT;
 
-// segment size in discrete price units (e.g. 5.0 = 5 dollars/points of price)
-input double              InpSegmentSizePrice  = 5.0;
+// tracking parameters (IN PRICE UNITS, e.g. 10.0 = $10 move)
+input double              InpThresholdPoints   = 10.0;   
+input double              InpReversalPercent   = 30.0; 
+
 input string              InpFileName          = "ma_impulse_data.csv";
 
+// --- Session Inputs (UTC HOURS)
+input int                 InpSydneyStart       = 22;
+input int                 InpSydneyEnd         = 7;
+input int                 InpTokyoStart        = 0;
+input int                 InpTokyoEnd          = 9;
+input int                 InpLondonStart       = 8;
+input int                 InpLondonEnd         = 17;
+input int                 InpNYStart           = 13;
+input int                 InpNYEnd             = 22;
+
 //--- global variables
-int      maHandle        = INVALID_HANDLE;
-int      fileHandle      = INVALID_HANDLE;
+int      handleMA;
+bool     isFirstBar = true;
+datetime lastBarTime = 0;
 
-bool     active          = false;      // tracking after a crossover?
-int      crossDirection  = 0;          // +1 bullish, -1 bearish
-double   crossPrice      = 0.0;
-datetime crossTime       = 0;
+//--- Wave State Structure
+struct WaveState {
+   bool     isActive;
+   int      type;             // 1 = Bullish, -1 = Bearish
+   datetime startTime;
+   string   startSession;     
+   double   startPrice;
+   
+   // --- Tracking for Reversal & Impulse Peaks
+   bool     isReversed;       // True if 30% reversal was hit
+   double   impulsePeakPrice; // The peak that was "Locked" by 30% reversal
+   datetime impulsePeakTime;
+   double   maAtImpulsePeak;  // Snapshot of MA at impulse peak
+   double   reversalPrice;    // Price where move reversed 30% from peak
+   datetime reversalTime;
+   double   maAtReversal;     // Snapshot of MA at reversal point
+   
+   // --- Deepest Retracement tracking (The "Low" until peak broken)
+   double   absLowPrice;      // The deepest point reached against the trend
+   datetime absLowTime;
+   double   maAtAbsLow;
+   bool     reversalCycleComplete; // Once trough is locked and new high found, stop reversal hunting
+   
+   double   extremePrice;     // The Absolute Peak for the entire wave duration
+   datetime extremeTime;
+   double   maPriceAtExtreme; // Snapshot of MA at absolute extreme
+} currentWave;
 
-double   maxFavorable    = 0.0;        // max favorable move in points
-double   maxAdverse      = 0.0;        // max adverse move in points (reserved for future use)
-int      lastSegmentLogged = 0;
-double   segmentSizePoints = 0.0;      // segment size expressed in points
-
-// per-segment tracking (stored in memory, flushed to CSV when sequence ends)
-datetime segmentTimes[];                // time when each segment level was first reached
-double   segmentPrices[];               // price when each segment level was first reached
-
-// overall extreme (highest high for bullish, lowest low for bearish)
-double   sequenceExtremePrice = 0.0;
-datetime sequenceExtremeTime  = 0;
-
-// crossover end time (time when opposite side close happens)
-datetime crossEndTime         = 0;
-
-// cached offset between server time and UTC (GMT)
-int      serverToUtcOffsetSec = 0;
-
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   //--- cache server->UTC offset (in seconds)
-   serverToUtcOffsetSec = (int)(TimeGMT() - TimeCurrent());
-
-   //--- create MA handle
-   maHandle = iMA(_Symbol, InpTimeframe,
-                  InpMAPeriod, InpMAShift, InpMAMethod, InpPrice);
-   if(maHandle == INVALID_HANDLE)
-   {
-      Print("MA_Impulse_Logger: failed to create MA handle. Error: ", GetLastError());
-      return(INIT_FAILED);
+   handleMA = iMA(_Symbol, InpTimeframe, InpMAPeriod, InpMAShift, InpMAMethod, InpPrice);
+   if(handleMA == INVALID_HANDLE) return(INIT_FAILED);
+   
+   currentWave.isActive = false;
+   
+   // Update Header with Full Descriptive Names for all 26 columns
+   if(!FileIsExist(InpFileName, FILE_COMMON)) {
+      int fileHandle = FileOpen(InpFileName, FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON, ',');
+      if(fileHandle != INVALID_HANDLE) {
+         FileWrite(fileHandle, 
+            "Symbol", "WaveDirection", "MovingAverageMethod", "MovingAveragePeriod", "ChartTimeframe", 
+            "CrossoverStartSession", "CrossoverEndSession",
+            "CrossoverStartTime", "CrossoverEndTime", 
+            "CrossoverStartPrice", "CrossoverEndPrice",
+            "AbsolutePeakPrice", "AbsolutePeakTime", "MA_At_AbsolutePeak",
+            "ImpulsePeakPrice", "ImpulsePeakTime", "MA_At_ImpulsePeak",
+            "ReversalPrice", "ReversalTime", "MA_At_Reversal",
+            "DeepestRetracePrice", "DeepestRetraceTime", "MA_At_DeepestRetrace",
+            "ReversalTriggered", "DifferencePoints", "DifferencePercent"
+         );
+         FileClose(fileHandle);
+      }
    }
 
-   //--- open / create CSV (comma separated) file
-   // FILE_READ | FILE_WRITE lets us append without losing existing data.
-   fileHandle = FileOpen(InpFileName,
-                         FILE_READ | FILE_WRITE | FILE_CSV | FILE_ANSI,
-                         ',');
-   if(fileHandle == INVALID_HANDLE)
-   {
-      Print("MA_Impulse_Logger: failed to open file: ", InpFileName,
-            " Error: ", GetLastError());
-      return(INIT_FAILED);
-   }
-
-   //--- if file is new, write header
-   if(FileSize(fileHandle) == 0)
-   {
-      FileWrite(fileHandle,
-         "symbol",
-         "session",
-         "cross_time",
-         "cross_end_time",
-         "cross_price",
-         "cross_type",
-         "segment_index",
-         "segment_time",
-         "segment_price",
-         "segment_size_price",
-         "segment_move_points",
-         "segment_move_percent",
-         "segment_direction",
-         "sequence_extreme_price",
-         "sequence_extreme_time",
-         "is_final"
-      );
-   }
-
-   //--- move to end of file for appending
-   FileSeek(fileHandle, 0, SEEK_END);
-
-   Print("MA_Impulse_Logger initialized. Logging to file: ", InpFileName);
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-{
-   if(fileHandle != INVALID_HANDLE)
-      FileClose(fileHandle);
-   if(maHandle != INVALID_HANDLE)
-      IndicatorRelease(maHandle);
-}
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) { IndicatorRelease(handleMA); }
 
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   static datetime lastBarTime = 0;
+   if(currentWave.isActive) UpdateExtreme();
 
-   //--- get last 3 bars on selected timeframe
-   MqlRates rates[3];
-   if(CopyRates(_Symbol, InpTimeframe, 0, 3, rates) != 3)
-      return;
+   datetime curBarTime = iTime(_Symbol, InpTimeframe, 0);
+   if(curBarTime != lastBarTime) {
+      if(isFirstBar) { lastBarTime = curBarTime; isFirstBar = false; return; }
 
-   //--- check new bar
-   if(rates[0].time != lastBarTime)
-   {
-      // new bar formed, check crossovers on the closed bar
-      CheckForCrossover(rates);
-      lastBarTime = rates[0].time;
-   }
-
-   //--- if we are tracking an active crossover, update impulse
-   if(active)
-      UpdateImpulse();
-}
-
-//+------------------------------------------------------------------+
-//| Detect MA crossovers on closed bars                              |
-//+------------------------------------------------------------------+
-void CheckForCrossover(const MqlRates &rates[])
-{
-   double ma[3];
-   if(CopyBuffer(maHandle, 0, 0, 3, ma) != 3)
-      return;
-
-   // indexes:
-   // rates[0] -> current forming bar
-   // rates[1] -> just closed bar
-   // rates[2] -> previous closed bar
-   double close0 = rates[1].close; // just closed
-   double ma0    = ma[1];
-
-   // side of price relative to MA for the just‑closed candle
-   int side = 0;
-   if(close0 > ma0)  side = +1;   // above MA -> bullish side
-   if(close0 < ma0)  side = -1;   // below MA -> bearish side
-
-   // if we are not yet tracking anything and we have a clear side, start it
-   if(!active && side != 0)
-   {
-      StartNewCrossover(side, close0, rates[1].time);
-      return;
-   }
-
-   // if we are tracking and the closed candle is on the opposite side,
-   // then the current crossover ENDS here and a new one immediately BEGINS
-   if(active && side != 0 && side != crossDirection)
-   {
-      // record crossover end time at this closed bar
-      crossEndTime = rates[1].time;
-      // end previous sequence and write its data
-      FinalizeSequence(true);
-      // start new sequence from this closed candle
-      StartNewCrossover(side, close0, rates[1].time);
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Start tracking a new crossover                                   |
-//+------------------------------------------------------------------+
-void StartNewCrossover(int direction, double price, datetime timeCross)
-{
-   // if already active, finalize the previous sequence
-   if(active)
-      FinalizeSequence(false);
-
-   active            = true;
-   crossDirection    = direction;
-   crossPrice        = price;
-   crossTime         = timeCross;
-   maxFavorable      = 0.0;
-   maxAdverse        = 0.0;
-   lastSegmentLogged = 0;
-
-   // compute segment size in points for this sequence
-   if(_Point > 0.0 && InpSegmentSizePrice > 0.0)
-      segmentSizePoints = InpSegmentSizePrice / _Point;
-   else
-      segmentSizePoints = 0.0;
-
-   // reset arrays and extremes
-   ArrayResize(segmentTimes, 0);
-   ArrayResize(segmentPrices, 0);
-   sequenceExtremePrice = price;
-   sequenceExtremeTime  = timeCross;
-
-   Print("MA_Impulse_Logger: new crossover dir=", direction,
-         " price=", DoubleToString(price, _Digits),
-         " time=", TimeToString(timeCross, TIME_DATE|TIME_SECONDS));
-}
-
-//+------------------------------------------------------------------+
-//| Update impulse on every tick                                     |
-//+------------------------------------------------------------------+
-void UpdateImpulse()
-{
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double point = _Point;
-
-   if(point <= 0.0)
-      return;
-
-   // update true extreme using bar high/low of current bar
-   double barHigh = iHigh(_Symbol, InpTimeframe, 0);
-   double barLow  = iLow(_Symbol,  InpTimeframe, 0);
-
-   // compute favorable move using true extremes (not synthetic levels),
-   // and keep track of the max favorable extreme price and its time
-   double favorableMovePoints = 0.0;
-   if(crossDirection == +1) // bullish
-   {
-      // update bullish extreme as highest high seen since crossover
-      if(barHigh > sequenceExtremePrice || sequenceExtremePrice == 0.0)
-      {
-         sequenceExtremePrice = barHigh;
-         sequenceExtremeTime  = TimeCurrent();
+      double maVal[2], closeVal[2], prevMA[1], prevClose[1];
+      if(CopyBuffer(handleMA, 0, 1, 1, maVal) < 1 || CopyClose(_Symbol, InpTimeframe, 1, 1, closeVal) < 1) return;
+      if(CopyBuffer(handleMA, 0, 2, 1, prevMA) < 1 || CopyClose(_Symbol, InpTimeframe, 2, 1, prevClose) < 1) return;
+      
+      bool isBullCross = (prevClose[0] <= prevMA[0] && closeVal[0] > maVal[0]);
+      bool isBearCross = (prevClose[0] >= prevMA[0] && closeVal[0] < maVal[0]);
+      
+      if(isBullCross || isBearCross) {
+         if(currentWave.isActive) LogWave(iTime(_Symbol, InpTimeframe, 1), closeVal[0]);
+         
+         currentWave.isActive = true;
+         currentWave.type = isBullCross ? 1 : -1;
+         currentWave.startTime = iTime(_Symbol, InpTimeframe, 1);
+         currentWave.startSession = GetCurrentSessions(currentWave.startTime);
+         currentWave.startPrice = closeVal[0];
+         
+         currentWave.extremePrice = isBullCross ? iHigh(_Symbol, InpTimeframe, 1) : iLow(_Symbol, InpTimeframe, 1);
+         currentWave.extremeTime = currentWave.startTime;
+         currentWave.maPriceAtExtreme = maVal[0];
+         
+         // Initialize Impulse tracking
+         currentWave.isReversed = false;
+         currentWave.impulsePeakPrice = currentWave.extremePrice;
+         currentWave.impulsePeakTime = currentWave.extremeTime;
+         currentWave.maAtImpulsePeak = currentWave.maPriceAtExtreme;
+         currentWave.reversalPrice = 0;
+         currentWave.reversalTime = 0;
+         currentWave.maAtReversal = 0;
+         
+         currentWave.absLowPrice = 0;
+         currentWave.absLowTime = 0;
+         currentWave.maAtAbsLow = 0;
+         currentWave.reversalCycleComplete = false;
       }
-
-      if(sequenceExtremePrice > crossPrice)
-         favorableMovePoints = (sequenceExtremePrice - crossPrice) / point;
-   }
-   else if(crossDirection == -1) // bearish
-   {
-      // update bearish extreme as lowest low seen since crossover
-      if(barLow < sequenceExtremePrice || sequenceExtremePrice == 0.0)
-      {
-         sequenceExtremePrice = barLow;
-         sequenceExtremeTime  = TimeCurrent();
-      }
-
-      if(sequenceExtremePrice < crossPrice)
-         favorableMovePoints = (crossPrice - sequenceExtremePrice) / point;
-   }
-
-   // store for completeness (not strictly needed for segments now)
-   if(favorableMovePoints > maxFavorable) maxFavorable = favorableMovePoints;
-
-   //--- log new favorable segments in memory (segment size is in PRICE units)
-   if(segmentSizePoints <= 0.0)
-      return;
-
-   int currentSegIndex = (int)(favorableMovePoints / segmentSizePoints);
-
-   while(currentSegIndex > lastSegmentLogged)
-   {
-      int    segIdx          = lastSegmentLogged + 1;
-      double segExtremePoints = (double)segIdx * segmentSizePoints; // distance from crossPrice in points
-      // grow arrays and store the true extreme price/time when this segment
-      // threshold was first exceeded
-      ArrayResize(segmentTimes,  segIdx);
-      ArrayResize(segmentPrices, segIdx);
-      segmentTimes[segIdx - 1]  = sequenceExtremeTime;
-      segmentPrices[segIdx - 1] = sequenceExtremePrice;
-
-      lastSegmentLogged = segIdx;
+      lastBarTime = curBarTime;
    }
 }
 
 //+------------------------------------------------------------------+
-//| Finalize a sequence (e.g. when opposite crossover appears)       |
-//| Here called only when starting a new crossover.                  |
+//| Update extreme price during active wave                          |
 //+------------------------------------------------------------------+
-void FinalizeSequence(bool oppositeCross)
+void UpdateExtreme()
 {
-   if(!active)
-      return;
+   double high = iHigh(_Symbol, InpTimeframe, 0);
+   double low  = iLow(_Symbol, InpTimeframe, 0);
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double ma[1];
+   
+   // 1. Always track Absolute Peak (no matter what)
+   if(currentWave.type == 1 && currentBid > currentWave.extremePrice) {
+      currentWave.extremePrice = currentBid;
+      currentWave.extremeTime = TimeCurrent();
+      if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maPriceAtExtreme = ma[0];
+   } else if(currentWave.type == -1 && (currentAsk < currentWave.extremePrice || currentWave.extremePrice == 0)) {
+      currentWave.extremePrice = currentAsk;
+      currentWave.extremeTime = TimeCurrent();
+      if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maPriceAtExtreme = ma[0];
+   }
 
-   // when the opposite crossover appears, flush all stored segments to CSV.
-   // Each segment row contains: cross time/price, segment time/price, and move metrics.
-   // If no segment thresholds were ever reached, write a single row for the crossover itself
-   // with segment_index = 0. If segments exist, we skip the 0 row and only write segments.
-   if(lastSegmentLogged == 0)
-   {
-      WriteSegment(
-         0,                   // segment_index 0 => crossover candle itself
-         crossPrice,          // price at crossover (close price)
-         crossTime,           // time at crossover (close time)
-         0.0,                 // movePoints = 0 at start
-         0,                   // FLAT relative direction at start
-         1                    // no segments hit, so this row is final
+   // 2. Impulse & Reversal Tracking Logic
+   if(currentWave.type == 1) { // BULLISH
+
+      if(!currentWave.isReversed && !currentWave.reversalCycleComplete) {
+         // === PHASE A: Track the High + Hunt for 30% Reversal ===
+         if(currentBid > currentWave.impulsePeakPrice) {
+            currentWave.impulsePeakPrice = currentBid;
+            currentWave.impulsePeakTime  = TimeCurrent();
+            if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maAtImpulsePeak = ma[0];
+         }
+         double move = currentWave.impulsePeakPrice - currentWave.startPrice;
+         if(move >= InpThresholdPoints) {
+            if(currentBid <= currentWave.impulsePeakPrice - (move * InpReversalPercent / 100.0)) {
+               // 30% Reversal Triggered - LOCK impulsePeakPrice from here
+               currentWave.isReversed    = true;
+               currentWave.reversalPrice = currentBid;
+               currentWave.reversalTime  = TimeCurrent();
+               if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maAtReversal = ma[0];
+               currentWave.absLowPrice   = currentBid;
+               currentWave.absLowTime    = TimeCurrent();
+               if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maAtAbsLow = ma[0];
+            }
+         }
+
+      } else if(currentWave.isReversed) {
+         // === PHASE B: Track Trough ONLY. impulsePeakPrice is LOCKED. ===
+         if(currentBid < currentWave.absLowPrice) {
+            currentWave.absLowPrice = currentBid;
+            currentWave.absLowTime  = TimeCurrent();
+            if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maAtAbsLow = ma[0];
+         }
+         // Breakout: old peak broken -> Trough is locked, switch to Phase C
+         if(currentBid > currentWave.impulsePeakPrice) {
+            currentWave.isReversed           = false;
+            currentWave.reversalCycleComplete = true;
+         }
+
+      }
+      // === PHASE C: reversalCycleComplete = true ===
+      // Do nothing here - extremePrice (AbsolutePeak) already tracks all-time high above.
+
+   } else { // BEARISH
+
+      if(!currentWave.isReversed && !currentWave.reversalCycleComplete) {
+         // === PHASE A: Track the Low + Hunt for 30% Reversal ===
+         if(currentAsk < currentWave.impulsePeakPrice || currentWave.impulsePeakPrice == 0) {
+            currentWave.impulsePeakPrice = currentAsk;
+            currentWave.impulsePeakTime  = TimeCurrent();
+            if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maAtImpulsePeak = ma[0];
+         }
+         double move = currentWave.startPrice - currentWave.impulsePeakPrice;
+         if(move >= InpThresholdPoints) {
+            if(currentAsk >= currentWave.impulsePeakPrice + (move * InpReversalPercent / 100.0)) {
+               // 30% Reversal Triggered - LOCK impulsePeakPrice from here
+               currentWave.isReversed    = true;
+               currentWave.reversalPrice = currentAsk;
+               currentWave.reversalTime  = TimeCurrent();
+               if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maAtReversal = ma[0];
+               currentWave.absLowPrice   = currentAsk;
+               currentWave.absLowTime    = TimeCurrent();
+               if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maAtAbsLow = ma[0];
+            }
+         }
+
+      } else if(currentWave.isReversed) {
+         // === PHASE B: Track Trough ONLY. impulsePeakPrice is LOCKED. ===
+         if(currentAsk > currentWave.absLowPrice) {
+            currentWave.absLowPrice = currentAsk;
+            currentWave.absLowTime  = TimeCurrent();
+            if(CopyBuffer(handleMA, 0, 0, 1, ma) > 0) currentWave.maAtAbsLow = ma[0];
+         }
+         // Breakout: old peak broken -> Trough is locked, switch to Phase C
+         if(currentAsk < currentWave.impulsePeakPrice && currentWave.impulsePeakPrice != 0) {
+            currentWave.isReversed           = false;
+            currentWave.reversalCycleComplete = true;
+         }
+
+      }
+      // === PHASE C: reversalCycleComplete = true ===
+      // Do nothing here - extremePrice (AbsolutePeak) already tracks all-time low above.
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Log to CSV                                                       |
+//+------------------------------------------------------------------+
+void LogWave(datetime endTime, double endPrice)
+{
+   double diff = MathAbs(currentWave.extremePrice - currentWave.startPrice);
+   
+   double pct = (currentWave.startPrice != 0) ? (diff / currentWave.startPrice) * 100.0 : 0;
+   string endSess = GetCurrentSessions(endTime);
+   ENUM_TIMEFRAMES tf = (InpTimeframe == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)Period() : InpTimeframe;
+   
+   int fileHandle = FileOpen(InpFileName, FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON, ',');
+   if(fileHandle != INVALID_HANDLE) {
+      FileSeek(fileHandle, 0, SEEK_END);
+      FileWrite(fileHandle,
+         _Symbol, (currentWave.type == 1 ? "BULL" : "BEAR"), EnumToString(InpMAMethod), InpMAPeriod, EnumToString(tf), 
+         currentWave.startSession, endSess,
+         TimeToString(currentWave.startTime), TimeToString(endTime), 
+         NormalizeDouble(currentWave.startPrice, _Digits), NormalizeDouble(endPrice, _Digits),
+         NormalizeDouble(currentWave.extremePrice, _Digits), TimeToString(currentWave.extremeTime), NormalizeDouble(currentWave.maPriceAtExtreme, _Digits),
+         NormalizeDouble(currentWave.impulsePeakPrice, _Digits), TimeToString(currentWave.impulsePeakTime), NormalizeDouble(currentWave.maAtImpulsePeak, _Digits),
+         NormalizeDouble(currentWave.reversalPrice, _Digits), TimeToString(currentWave.reversalTime), NormalizeDouble(currentWave.maAtReversal, _Digits),
+         NormalizeDouble(currentWave.absLowPrice, _Digits), TimeToString(currentWave.absLowTime), NormalizeDouble(currentWave.maAtAbsLow, _Digits),
+         (currentWave.absLowPrice != 0 ? "YES" : "NO"),
+         NormalizeDouble(diff, _Digits), NormalizeDouble(pct, 2)
       );
+      FileClose(fileHandle);
+      Print("Logged Wave: ", _Symbol, " Type: ", (currentWave.type == 1 ? "Bull" : "Bear"), " | Gap: ", diff);
+   } else {
+      Print("Failed to open file for logging: ", InpFileName);
    }
-   else
-   {
-      // Write one row per hit segment in order.
-      for(int i = 1; i <= lastSegmentLogged; i++)
-      {
-         // movement distance in PRICE units (dollars), not broker points
-         double movePoints = (double)i * InpSegmentSizePrice;
-         // movement is always in favor for these stored segments
-         int    dir        = +1;
-         int    isFinal    = (i == lastSegmentLogged ? 1 : 0);
-
-         WriteSegment(i, segmentPrices[i - 1], segmentTimes[i - 1], movePoints, dir, isFinal);
-      }
-   }
-
-   active = false;
+   currentWave.isActive = false;
 }
 
 //+------------------------------------------------------------------+
-//| Write one row (segment) to CSV                                   |
+//| Session Logic                                                    |
 //+------------------------------------------------------------------+
-void WriteSegment(int segmentIndex,
-                  double segmentPrice,
-                  datetime segmentTime,
-                  double movePoints,
-                  int segmentDirection,
-                  int isFinal)
+string GetCurrentSessions(datetime timeInput)
 {
-   if(fileHandle == INVALID_HANDLE)
-      return;
-
-   // movePoints is already in price units (dollars)
-   double movePrice = movePoints;
-
-   // percent move from crossPrice, using price units directly
-   double movePercent = 0.0;
-   if(crossPrice != 0.0)
-      movePercent = (movePrice / crossPrice) * 100.0;
-
-   // human-readable labels for direction fields
-   string crossTypeText;
-   if(crossDirection == 1)
-      crossTypeText = "BULLISH";
-   else if(crossDirection == -1)
-      crossTypeText = "BEARISH";
-   else
-      crossTypeText = "NONE";
-
-   string segmentDirText;
-   if(segmentDirection == 1)
-      segmentDirText = "FAVOR";
-   else if(segmentDirection == -1)
-      segmentDirText = "AGAINST";
-   else
-      segmentDirText = "FLAT";
-
-   // derive session name based on UTC time of the segment
-   string sessionName;
-   datetime utcTime = segmentTime + serverToUtcOffsetSec;
-   MqlDateTime tm;
-   TimeToStruct(utcTime, tm);
-   int hour = tm.hour;
-
-   // Four main sessions, using standard UTC windows:
-   // Sydney: 21:00–06:00, Tokyo: 23:00–08:00, London: 08:00–17:00, New York: 13:00–22:00
-   if((hour >= 21 && hour <= 23) || (hour >= 0 && hour < 6))
-      sessionName = "SYDNEY";
-   else if(hour >= 23 || hour < 8)
-      sessionName = "TOKYO";
-   else if(hour >= 8 && hour < 13)
-      sessionName = "LONDON";
-   else if(hour >= 13 && hour < 22)
-      sessionName = "NEW_YORK";
-   else
-      sessionName = "OFF_SESSION";
-
-   FileWrite(fileHandle,
-      _Symbol,                                      // symbol
-      sessionName,                                  // session
-      TimeToString(crossTime, TIME_DATE|TIME_SECONDS), // cross_time
-      TimeToString(crossEndTime, TIME_DATE|TIME_SECONDS), // cross_end_time
-      DoubleToString(crossPrice, _Digits),           // cross_price
-      crossTypeText,                                 // cross_type (BULLISH/BEARISH)
-      segmentIndex,                                  // segment_index
-      TimeToString(segmentTime, TIME_DATE|TIME_SECONDS), // segment_time
-      DoubleToString(segmentPrice, _Digits),         // segment_price
-      InpSegmentSizePrice,                           // segment_size_price (price units)
-      movePoints,                                    // segment_move_points (PRICE units from cross)
-      movePercent,                                   // segment_move_percent
-      segmentDirText,                                // segment_direction (FAVOR/AGAINST)
-      DoubleToString(sequenceExtremePrice, _Digits), // sequence_extreme_price (max/min before crossover end)
-      TimeToString(sequenceExtremeTime, TIME_DATE|TIME_SECONDS), // sequence_extreme_time
-      isFinal                                        // is_final
-   );
-
-   FileFlush(fileHandle);
+   datetime local = TimeCurrent();
+   datetime gmt = TimeGMT();
+   int offset = (int)(local - gmt);
+   datetime utc = timeInput - offset;
+   MqlDateTime dt; TimeToStruct(utc, dt);
+   
+   string s = "";
+   if(IsTimeInRange(dt.hour, InpSydneyStart, InpSydneyEnd)) s += (s==""?"":"-") + "Sydney";
+   if(IsTimeInRange(dt.hour, InpTokyoStart, InpTokyoEnd))   s += (s==""?"":"-") + "Tokyo";
+   if(IsTimeInRange(dt.hour, InpLondonStart, InpLondonEnd)) s += (s==""?"":"-") + "London";
+   if(IsTimeInRange(dt.hour, InpNYStart, InpNYEnd))         s += (s==""?"":"-") + "NewYork";
+   
+   if(s == "") return "Closed";
+   return s;
 }
 
+bool IsTimeInRange(int h, int s, int e) {
+   if(s < e) return (h >= s && h < e);
+   return (h >= s || h < e);
+}

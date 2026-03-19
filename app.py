@@ -24,6 +24,7 @@ import statsmodels.api as sm
 import quantstats as qs
 import duckdb
 import polars as pl
+import xgboost as xgb
 
 # Lazy/Optional Heavy Imports
 try:
@@ -161,19 +162,87 @@ if not check_password():
 # Sidebar configuration
 with st.sidebar:
     st.header("⚙️ Configuration")
+    provider_choice = st.selectbox("Select AI Provider", [
+        "NVIDIA", "Groq", "OpenRouter", "OpenRouter (Free)", "Gemini", "GitHub Models", "Cerebras", "Bytez"
+    ])
+    
     # Leave value empty to prevent dots being shown in the DOM (security measure)
-    input_api_key = st.text_input("NVIDIA API Key", value="", type="password", help="Enter your NVIDIA NIM API Key. If left blank, the system will attempt to use the pre-configured station key.")
+    input_api_key = st.text_input(f"{provider_choice} API Key", value="", type="password", help=f"Enter your {provider_choice} API Key.")
     
     # Resolve the key: User input takes priority, secret is used as a silent fallback
-    api_key_to_use = input_api_key if input_api_key else st.secrets.get("NVIDIA_API_KEY", "")
+    secret_key_name = f"{provider_choice.upper().replace(' ', '_').replace('(', '').replace(')', '')}_API_KEY"
+    if provider_choice == "OpenRouter" or provider_choice == "OpenRouter (Free)":
+        secret_key_name = "OPEN_ROUTER_API_KEY"
+    elif provider_choice == "GitHub Models":
+        secret_key_name = "GITHUB_API_KEY"
     
-    model_choice = st.selectbox("Select Model", [
-        "qwen/qwen3.5-122b-a10b",
-        "qwen/qwen2.5-coder-32b-instruct",
-        "deepseek-ai/deepseek-v3.1",
-        "deepseek-ai/deepseek-r1-distill-qwen-32b",
-        "nvidia/llama-3.1-405b-instruct"
-    ])
+    api_key_to_use = input_api_key if input_api_key else st.secrets.get(secret_key_name, "")
+    
+    if provider_choice == "NVIDIA":
+        model_choice = st.selectbox("Select Model", [
+            "qwen/qwen3.5-122b-a10b",
+            "qwen/qwen2.5-coder-32b-instruct",
+            "deepseek-ai/deepseek-v3.1",
+            "deepseek-ai/deepseek-r1-distill-qwen-32b",
+            "nvidia/llama-3.1-405b-instruct"
+        ])
+        base_url = "https://integrate.api.nvidia.com/v1"
+    elif provider_choice == "Groq":
+        model_choice = st.selectbox("Select Model", [
+            "llama3-70b-8192",
+            "llama3-8b-8192",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it",
+            "deepseek-r1-distill-llama-70b"
+        ])
+        base_url = "https://api.groq.com/openai/v1"
+    elif provider_choice == "OpenRouter":
+        model_choice = st.selectbox("Select Model", [
+            "anthropic/claude-3.5-sonnet",
+            "anthropic/claude-3-5-haiku",
+            "meta-llama/llama-3.1-70b-instruct",
+            "google/gemini-pro-1.5",
+            "mistralai/mixtral-8x22b-instruct"
+        ])
+        base_url = "https://openrouter.ai/api/v1"
+    elif provider_choice == "OpenRouter (Free)":
+        model_choice = st.selectbox("Select Free Model", [
+            "deepseek/deepseek-r1:free",
+            "google/gemini-pro-1.5:free",
+            "meta-llama/llama-3.1-8b-instruct:free",
+            "mistralai/mistral-nemo:free"
+        ])
+        base_url = "https://openrouter.ai/api/v1"
+    elif provider_choice == "GitHub Models":
+        model_choice = st.selectbox("Select Free Model", [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "meta-llama-3.1-70b-instruct",
+            "AI21-Jamba-1.5-Large"
+        ])
+        base_url = "https://models.inference.ai.azure.com"
+    elif provider_choice == "Cerebras":
+        model_choice = st.selectbox("Select Free Model", [
+            "llama3.1-70b",
+            "llama3.1-8b"
+        ])
+        base_url = "https://api.cerebras.ai/v1"
+    elif provider_choice == "Gemini":
+        model_choice = st.selectbox("Select Model", [
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-1.5-flash",
+            "gemini-1.5-pro"
+        ])
+        base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    elif provider_choice == "Bytez":
+        model_choice = st.selectbox("Select Model", [
+            "meta-llama/Meta-Llama-3-8B-Instruct",
+            "mistralai/Mistral-7B-Instruct-v0.2",
+            "Qwen/Qwen1.5-72B-Chat"
+        ])
+        base_url = "https://api.bytez.com/models/v2/openai/"
+
     enable_thinking = st.checkbox("Enable Thinking Mode", value=True)
     show_debug = st.checkbox("Show AI Trace (Debug)", value=False)
     
@@ -184,9 +253,11 @@ with st.sidebar:
             st.error("No API Key found! Please enter one.")
         else:
             try:
-                # Test with standard prefix logic
-                test_key = api_key_to_use if api_key_to_use.startswith("nvapi-") else f"nvapi-{api_key_to_use}"
-                test_client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=test_key)
+                test_key = api_key_to_use
+                if provider_choice == "NVIDIA" and not test_key.startswith("nvapi-"):
+                    test_key = f"nvapi-{test_key}"
+                
+                test_client = OpenAI(base_url=base_url, api_key=test_key)
                 test_client.models.list()
                 st.success("✅ Connection Successful!")
             except Exception as e:
@@ -202,7 +273,11 @@ with st.sidebar:
     if AGGRID_AVAILABLE: st.success("✅ Data Grid Ready")
     else: st.warning("⚠️ Data Grid Disabled (Memory)")
     
-    st.info("Upload your CSV file to begin analysis.")
+    st.markdown("---")
+    st.subheader("🧠 Memory & Context")
+    if st.button("🗑️ Clear AI Memory Context", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
 
 # Arrow-safe display helper (fixes PyArrow serialization errors)
 def make_arrow_safe(df):
@@ -221,14 +296,23 @@ def make_arrow_safe(df):
 # Data Processing logic
 def process_data(uploaded_file):
     try:
-        # Load EVERYTHING as string first to prevent 'object' type confusion
-        df = pd.read_csv(uploaded_file, dtype=str, low_memory=False)
+        if uploaded_file.name.endswith('.parquet'):
+            # Parquet files are strongly typed and natively supported
+            df = pd.read_parquet(uploaded_file)
+        else:
+            # Load EVERYTHING as string first to prevent 'object' type confusion
+            df = pd.read_csv(uploaded_file, dtype=str, low_memory=False)
         
-        # Manually convert known numeric columns
+        # Manually convert known numeric columns (support both Segmented and MA Impulse formats)
         numeric_cols = [
             'cross_price', 'segment_index', 'segment_price', 
             'segment_size_price', 'segment_move_points', 
-            'segment_move_percent', 'sequence_extreme_price', 'is_final'
+            'segment_move_percent', 'sequence_extreme_price', 'is_final',
+            'DifferencePoints', 'DifferencePercent', 'MovingAveragePeriod',
+            'CrossoverStartPrice', 'CrossoverEndPrice', 'AbsolutePeakPrice',
+            'ImpulsePeakPrice', 'ReversalPrice', 'MA_At_AbsolutePeak',
+            'MA_At_ImpulsePeak', 'MA_At_Reversal', 'DeepestRetracePrice',
+            'MA_At_DeepestRetrace'
         ]
         
         for col in numeric_cols:
@@ -241,7 +325,11 @@ def process_data(uploaded_file):
                 df[col] = df[col].fillna("UNKNOWN").astype(str)
         
         # Convert timestamps (naive datetime64[ns] for Arrow compatibility)
-        time_cols = ['cross_time', 'cross_end_time', 'segment_time', 'sequence_extreme_time']
+        time_cols = [
+            'cross_time', 'cross_end_time', 'segment_time', 'sequence_extreme_time',
+            'CrossoverStartTime', 'CrossoverEndTime', 'AbsolutePeakTime',
+            'ImpulsePeakTime', 'ReversalTime', 'DeepestRetraceTime'
+        ]
         for col in time_cols:
             if col in df.columns:
                 dt = pd.to_datetime(df[col], errors='coerce', utc=False)
@@ -296,7 +384,8 @@ def execute_generated_code(code, df):
         'qs': qs,
         'duck': duckdb,
         'pl': pl,
-        'alt': alt
+        'alt': alt,
+        'xgb': xgb
     }
     output = io.StringIO()
     # Close any existing plots
@@ -311,18 +400,84 @@ def execute_generated_code(code, df):
 # Main Application
 st.title("🏛️ NVIDIA NIM Professional Quant Station")
 
-# File uploader
-uploaded_file = st.file_uploader("Choose a CSV file", type=['csv'])
+st.markdown("### 📥 Select Dataset")
+colA, colB, colC = st.columns([1.5, 2, 1])
+with colA:
+    symbol_choice = st.selectbox(
+        "Select Symbol", 
+        ["XAUUSD", "EURUSD", "DXY"],
+        label_visibility="collapsed"
+    )
+with colB:
+    if st.button(f"🚀 Load {symbol_choice} Data", use_container_width=True):
+        import os
+        filename = f"{symbol_choice}_M1_Data.parquet"
+        if os.path.exists(filename):
+            with st.spinner(f"Loading {filename}..."):
+                st.session_state.df = pd.read_parquet(filename)
+                st.session_state.file_name = filename
+                st.session_state.messages = []
+                st.rerun()
+        else:
+            st.error(f"Server dataset '{filename}' not found!")
+
+with colC:
+    if st.button("🧹 Clear Dataset", use_container_width=True):
+        if 'df' in st.session_state:
+            del st.session_state['df']
+        st.session_state.messages = []
+        st.rerun()
+
+# File uploader (Fallback)
+uploaded_file = st.file_uploader("Or manually upload a CSV or Parquet dataset file", type=['csv', 'parquet'])
 
 if uploaded_file is not None:
     if 'df' not in st.session_state or st.session_state.file_name != uploaded_file.name:
-        with st.spinner("Optimizing data with Parquet..."):
+        with st.spinner("Optimizing data..."):
             st.session_state.df = process_data(uploaded_file)
             st.session_state.file_name = uploaded_file.name
             st.session_state.messages = []
             st.success("Professional environment initialized!")
 
-    df = st.session_state.df
+if 'df' in st.session_state and st.session_state.df is not None:
+    df_raw = st.session_state.df.copy()
+    
+    # --- DATE RANGE FILTERING ---
+    time_cols = [c for c in df_raw.columns if 'time' in c.lower() or 'date' in c.lower()]
+    if time_cols:
+        main_time_col = time_cols[0]
+        # Force to datetime for filtering
+        df_raw[main_time_col] = pd.to_datetime(df_raw[main_time_col], errors='coerce')
+        valid_dates = df_raw[main_time_col].dropna()
+        if not valid_dates.empty:
+            st.markdown("### 📅 Filter Data by Date")
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
+            
+            selected_dates = st.date_input(
+                f"Select Range ({main_time_col})", 
+                value=[min_date, max_date], 
+                min_value=min_date, 
+                max_value=max_date
+            )
+            
+            if len(selected_dates) == 2:
+                start_date, end_date = selected_dates
+                mask = (df_raw[main_time_col].dt.date >= start_date) & (df_raw[main_time_col].dt.date <= end_date)
+                df = df_raw.loc[mask].copy()
+                st.info(f"✅ Filtered to {len(df):,} rows (from {start_date} to {end_date}).")
+            else:
+                df = df_raw.copy()
+        else:
+            df = df_raw.copy()
+    else:
+        df = df_raw.copy()
+        
+    # Convert time columns back to strings so Arrow Serialization never fails when rendering Tabs
+    for c in df.columns:
+        if str(df[c].dtype).startswith("datetime"):
+            df[c] = df[c].astype(str)
+
 
     # TABBED NAVIGATION
     tab1, tab2, tab3 = st.tabs(["💬 AI Analyst", "🔍 Visual Explorer", "📋 Interactive Data Grid"])
@@ -359,7 +514,46 @@ if uploaded_file is not None:
                 elif "exec_result" in message:
                     st.markdown(message["exec_result"])
 
-        if prompt := st.chat_input("Ask for analysis, code, or charts..."):
+        # --- QUANT PROMPT LIBRARY ---
+        st.markdown("---")
+        with st.expander("💡 **Quant Prompt Library** (One-Click Analysis)", expanded=False):
+            st.info("Select a professional analysis template below to instantly generate a quantitative report.")
+            
+            st.markdown("##### 📌 Standard Analysis")
+            prompt_cols = st.columns(2)
+            with prompt_cols[0]:
+                if st.button("📈 Target Escalation Matrix"):
+                    st.session_state.pending_prompt = "Analyze moves that reach $10 (100 points). Calculate the probability of them extending to $15 and $20 using $2.5 bins before a 30% reversal occur. Show results in a clean table and a probability bar chart."
+                if st.button("🌍 Session Volatility Profile"):
+                    st.session_state.pending_prompt = "Break down the average 'DifferencePoints' and 'DifferencePercent' by trading session (CrossoverStartSession). Identify which session has the highest volatility and show a distribution plot formatted for a quant presentation."
+            with prompt_cols[1]:
+                if st.button("🔄 Mean Reversion Diagnostic"):
+                    st.session_state.pending_prompt = "For all moves exceeding $12, what is the 'YES' vs 'NO' rate for 'ReversalTriggered'? Show the average time taken for a reversal (ReversalTime - AbsolutePeakTime) per session in a summary table."
+                if st.button("⏱️ Wave Life-Cycle Analysis"):
+                    st.session_state.pending_prompt = "Calculate the average time in minutes from CrossoverStartTime to AbsolutePeakTime for each session. Show a comparative horizontal bar chart and highlight the session where price peaks the fastest."
+
+            st.markdown("---")
+            st.markdown("##### 🔬 Deep Retracement Analysis (New)")
+            deep_cols = st.columns(2)
+            with deep_cols[0]:
+                if st.button("🔻 Crossover Funnel Report"):
+                    st.session_state.pending_prompt = "Build a conversion funnel analysis: First count total crossovers. Then count how many had DifferencePoints >= 10 (crossed the $10 threshold). Then count how many of those had ReversalTriggered = YES. Show as a funnel table AND a bar chart with counts and conversion % at each step. Break it down by CrossoverStartSession."
+                if st.button("📊 True Depth Distribution"):
+                    st.session_state.pending_prompt = "For all waves where ReversalTriggered is YES, calculate the TRUE retracement percentage using the formula: true_retrace_pct = (ImpulsePeakPrice - DeepestRetracePrice) / (ImpulsePeakPrice - CrossoverStartPrice) * 100. Bin these results into: 30-40%, 40-60%, 60-80%, 80-100%, and 100%+. Show as a stacked bar chart broken down by CrossoverStartSession. This tells us how deep the market ACTUALLY went beyond the 30% trigger."
+            with deep_cols[1]:
+                if st.button("🛡️ Shallow vs Deep Reversal Outcome"):
+                    st.session_state.pending_prompt = "For all waves where ReversalTriggered is YES, calculate true_retrace_pct = (ImpulsePeakPrice - DeepestRetracePrice) / (ImpulsePeakPrice - CrossoverStartPrice) * 100. Split into Shallow (30-50%) and Deep (50%+). For each group, show: 1) How many had AbsolutePeakPrice > ImpulsePeakPrice (trend survived and made new high), 2) Average DifferencePoints, 3) Distribution by session. Show as a side-by-side comparison table and chart."
+                
+                if st.button("🎯 Session Target Range"):
+                    st.session_state.pending_prompt = "Filter rows where ReversalTriggered is YES. For BULL calculate Move=ImpulsePeakPrice-CrossoverStartPrice, for BEAR calculate Move=CrossoverStartPrice-ImpulsePeakPrice. Show average, median, min, max Move grouped by CrossoverStartSession. This tells us typical extension after $10 crossover but BEFORE the 30% reversal trigger. Show as a distribution box plot by session."
+
+        # Handle button clicks from library
+        prompt = st.chat_input("Ask for analysis, code, or charts...")
+        if "pending_prompt" in st.session_state:
+            prompt = st.session_state.pending_prompt
+            del st.session_state.pending_prompt
+
+        if prompt:
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"): st.markdown(prompt)
 
@@ -378,7 +572,7 @@ if uploaded_file is not None:
                     - quantstats (as qs): Financial performance reports.
                     - statsmodels (as sm): Econometric tests.
                     - pygwalker (as pyg): For visual explorers (use pyg.walk(df)).
-                    - math, scipy, sklearn, numpy, polars (as pl), duckdb (as duck).
+                    - math, scipy, sklearn, numpy, polars (as pl), duckdb (as duck), xgboost (as xgb).
                     
                     DATAFRAME SCHEMA:
                     {metadata}
@@ -402,13 +596,18 @@ if uploaded_file is not None:
                         full_txt = ""
                         ph = st.empty()
                         try:
-                            # Robust key handling: NVIDIA keys often require the nvapi- prefix
-                            final_key = api_key_to_use if api_key_to_use.startswith("nvapi-") else f"nvapi-{api_key_to_use}"
+                            # Robust key handling
+                            final_key = api_key_to_use
+                            if provider_choice == "NVIDIA" and not final_key.startswith("nvapi-"):
+                                final_key = f"nvapi-{final_key}"
                             
-                            # Using integrate.api.nvidia.com as the base
-                            client = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=final_key)
+                            client = OpenAI(base_url=base_url, api_key=final_key)
                             print(f"DEBUG: Starting stream with model {model_choice}...")
                             
+                            extra_kwargs = {}
+                            if provider_choice == "NVIDIA" and enable_thinking:
+                                extra_kwargs = {"chat_template_kwargs": {"enable_thinking": True}}
+
                             stream = client.chat.completions.create(
                                 model=model_choice,
                                 messages=msgs,
@@ -416,7 +615,7 @@ if uploaded_file is not None:
                                 top_p=0.7,
                                 max_tokens=16384,
                                 stream=True,
-                                extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+                                extra_body=extra_kwargs if extra_kwargs else None
                             )
                             
                             for chunk in stream:
@@ -430,7 +629,7 @@ if uploaded_file is not None:
                             return full_txt
                         except Exception as e:
                             print(f"DEBUG: OpenAI Client Error: {e}")
-                            st.error(f"NVIDIA API Error: {e}")
+                            st.error(f"API Error: {e}")
                             return f"ERROR: {e}"
 
                     # Initial Chat
@@ -503,5 +702,6 @@ if uploaded_file is not None:
             st.dataframe(make_arrow_safe(df.head(100)))
 
 else:
-    st.write("👋 Welcome! Please upload a crossover impulse dataset to start the analysis.")
+    st.write("👋 Welcome! Please upload your dataset (CSV or Parquet) to start the analysis.")
+    st.info("💡 **Any time-series, financial OHLC data, or custom data is completely supported.** The AI knows how to adapt to your specific dataset.")
     st.image("https://developer.nvidia.com/sites/default/files/akamai/NVIDIA_NIM_Icon.png", width=100)

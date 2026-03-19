@@ -1,6 +1,16 @@
 # Streamlit secrets (never commit API keys or passwords)
 .streamlit/secrets.toml
 
+# User's specific ignores
+ea/
+added_impulse_analysis19-03-26.zip
+ma_impulse_data_oldafterold.csv
+ma_impulse_data.csv
+MA_Impulse_Logger_backup_multipleaiadded.zip
+
+# Parquet Data files (ignored by default to keep repo clean)
+*.parquet
+
 # Data files (can be regenerated)
 *.csv
 
