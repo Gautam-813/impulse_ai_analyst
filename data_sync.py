@@ -86,7 +86,8 @@ def get_gap_info(df: pd.DataFrame) -> dict:
 # 4. Fetch ONLY the missing candles from the MT5 Data Server
 # -----------------------------------------------------------------------
 def fetch_delta_from_mt5(server_url: str, symbol: str,
-                          from_time: datetime, to_time: datetime) -> pd.DataFrame:
+                          from_time: datetime, to_time: datetime,
+                          mt5_token: str = "") -> pd.DataFrame:
     """Call the local MT5 FastAPI server for gap candles only."""
     try:
         payload = {
@@ -95,8 +96,9 @@ def fetch_delta_from_mt5(server_url: str, symbol: str,
             "start_date": from_time.isoformat(),
             "end_date":   to_time.isoformat()
         }
+        headers = {"X-MT5-Token": mt5_token}
         resp = requests.post(f"{server_url.rstrip('/')}/data/fetch",
-                             json=payload, timeout=90)
+                             json=payload, headers=headers, timeout=90)
         resp.raise_for_status()
         data = resp.json()
         if not data.get("success"):
@@ -156,7 +158,8 @@ def merge_and_push(existing_df: pd.DataFrame, delta_df: pd.DataFrame,
 # 6. One-click full sync for a single symbol
 # -----------------------------------------------------------------------
 def sync_symbol(repo_id: str, symbol: str,
-                hf_token: str, mt5_server_url: str) -> tuple[pd.DataFrame, dict]:
+                hf_token: str, mt5_server_url: str,
+                mt5_token: str = "") -> tuple[pd.DataFrame, dict]:
     """
     Full pipeline:
       load parquet → check gap → fetch delta → merge → push → return fresh df + stats
@@ -177,7 +180,7 @@ def sync_symbol(repo_id: str, symbol: str,
 
     # Step 3 — Fetch only missing delta from MT5
     from_time = gap_info["last_timestamp"]
-    delta_df  = fetch_delta_from_mt5(mt5_server_url, symbol, from_time, now)
+    delta_df  = fetch_delta_from_mt5(mt5_server_url, symbol, from_time, now, mt5_token)
 
     if delta_df.empty:
         return existing_df, {
@@ -199,10 +202,11 @@ def sync_symbol(repo_id: str, symbol: str,
 # -----------------------------------------------------------------------
 # 7. Ping MT5 server health
 # -----------------------------------------------------------------------
-def ping_mt5_server(server_url: str) -> dict:
+def ping_mt5_server(server_url: str, mt5_token: str = "") -> dict:
     """Returns status dict: {reachable, mt5_initialized, account, server}"""
     try:
-        resp = requests.get(f"{server_url.rstrip('/')}/health", timeout=4)
+        headers = {"X-MT5-Token": mt5_token}
+        resp = requests.get(f"{server_url.rstrip('/')}/health", headers=headers, timeout=4)
         data = resp.json()
         return {
             "reachable":       True,

@@ -7,12 +7,23 @@ import MetaTrader5 as mt5
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Annotated
 import re
 import uvicorn
+import os
+
+# ============================================================================
+# Security Configuration
+# ============================================================================
+MT5_API_TOKEN = os.getenv("MT5_API_TOKEN", "impulse_secure_2026")
+
+async def verify_token(x_mt5_token: Annotated[str | None, Header()] = None):
+    if x_mt5_token != MT5_API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing MT5 Security Token")
+    return x_mt5_token
 
 # ============================================================================
 # FastAPI App
@@ -180,7 +191,7 @@ provider = MT5DataProvider()
 # ============================================================================
 
 @app.get("/health")
-def health_check():
+def health_check(token: Annotated[str, Depends(verify_token)]):
     """Check if server is running and MT5 status"""
     return {
         "status": "running",
@@ -189,7 +200,7 @@ def health_check():
     }
 
 @app.post("/initialize")
-def initialize(req: InitializeRequest):
+def initialize(req: InitializeRequest, token: Annotated[str, Depends(verify_token)]):
     """Initialize MT5 connection"""
     success = provider.initialize_mt5(req.terminal_path)
     if success:
@@ -207,7 +218,7 @@ def initialize(req: InitializeRequest):
     })
 
 @app.post("/symbols/search")
-def search_symbols(req: SymbolSearchRequest):
+def search_symbols(req: SymbolSearchRequest, token: Annotated[str, Depends(verify_token)]):
     """Search for symbols matching a regex pattern"""
     if not provider.initialized:
         raise HTTPException(status_code=400, detail="MT5 not initialized")
@@ -221,7 +232,7 @@ def search_symbols(req: SymbolSearchRequest):
     }
 
 @app.get("/symbols/info/{symbol}")
-def symbol_info(symbol: str):
+def symbol_info(symbol: str, token: Annotated[str, Depends(verify_token)]):
     """Get detailed symbol information"""
     if not provider.initialized:
         raise HTTPException(status_code=400, detail="MT5 not initialized")
@@ -231,7 +242,7 @@ def symbol_info(symbol: str):
     return info
 
 @app.post("/data/fetch")
-def fetch_data(req: FetchDataRequest):
+def fetch_data(req: FetchDataRequest, token: Annotated[str, Depends(verify_token)]):
     """
     Fetch OHLC data and return directly as JSON.
 
@@ -273,7 +284,7 @@ def fetch_data(req: FetchDataRequest):
     }
 
 @app.post("/data/quick-fetch")
-def quick_fetch(req: QuickFetchRequest):
+def quick_fetch(req: QuickFetchRequest, token: Annotated[str, Depends(verify_token)]):
     """
     Quick fetch with common presets.
 
@@ -323,7 +334,7 @@ def quick_fetch(req: QuickFetchRequest):
     }
 
 @app.post("/shutdown")
-def shutdown_mt5():
+def shutdown_mt5(token: Annotated[str, Depends(verify_token)]):
     """Shutdown MT5 connection"""
     provider.shutdown()
     return {"success": True, "message": "MT5 connection closed"}

@@ -292,9 +292,14 @@ with st.sidebar:
                              key="mt5_url_input",
                              placeholder="http://localhost:5000")
 
+    mt5_token = st.text_input("MT5 Security Token",
+                               value=st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026"),
+                               type="password",
+                               help="The token configured in your MT5 Data Server.")
+
     if st.button("🔌 Test MT5 Connection", use_container_width=True):
         from data_sync import ping_mt5_server
-        result = ping_mt5_server(mt5_url)
+        result = ping_mt5_server(mt5_url, mt5_token)
         if result["reachable"] and result["mt5_initialized"]:
             st.success("✅ MT5 Server Connected & Ready")
             st.session_state.mt5_url = mt5_url
@@ -338,7 +343,7 @@ with st.sidebar:
                     from data_sync import sync_symbol
                     with st.spinner(f"Syncing {sym}…"):
                         try:
-                            updated_df, stats = sync_symbol(hf_repo, sym, hf_token, mt5_url)
+                            updated_df, stats = sync_symbol(hf_repo, sym, hf_token, mt5_url, mt5_token)
                             st.session_state[f"df_{sym}"] = updated_df
                             if stats["status"] == "already_fresh":
                                 st.success(f"✅ {sym} already up to date")
@@ -366,7 +371,7 @@ with st.sidebar:
             if hf_repo and hf_token and mt5_url:
                 from data_sync import sync_symbol
                 try:
-                    updated_df, stats = sync_symbol(hf_repo, current_sym, hf_token, mt5_url)
+                    updated_df, stats = sync_symbol(hf_repo, current_sym, hf_token, mt5_url, mt5_token)
                     st.session_state[f"df_{current_sym}"] = updated_df
                     st.toast(f"🔄 Auto-Synced {current_sym} ({stats.get('new_rows', 0)} new candles)")
                 except Exception as e:
