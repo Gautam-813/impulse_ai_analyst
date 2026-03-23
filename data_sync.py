@@ -259,6 +259,9 @@ def sync_yahoo_symbol(repo_id: str, symbol: str, hf_token: str,
     from huggingface_hub import upload_file
 
     def _yf_filename(s: str, i: str) -> str:
+        # Check if this is a standard MT5-style symbol
+        for mt5_sym, yh_sym in YAHOO_MAPPING.items():
+            if s == yh_sym: return f"{mt5_sym}_M1_Data.parquet"
         return f"{s}_{i}_Data.parquet"
 
     # Step 1 — Fetch new data from Yahoo

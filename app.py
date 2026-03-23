@@ -697,14 +697,13 @@ with colB:
                     with st.status(f"🛰️ Auto-Bridging {symbol_choice}... (Gap: {gap['label']})"):
                         try:
                             from data_sync import sync_yahoo_symbol
-                            # Use '1d' or '1h' logic here. For now, we'll keep it simple.
-                            # We determine the interval from the loaded data if possible.
-                            # Default to 1d sync for indices/commodities
-                            sync_df, sync_stats = sync_yahoo_symbol(hf_repo, target_yh, hf_token, period="1mo", interval="1d")
+                            # Use '1m' to match the M1 master history
+                            # period '7d' is the max for 1m data on Yahoo Finance
+                            sync_df, sync_stats = sync_yahoo_symbol(hf_repo, target_yh, hf_token, period="7d", interval="1m")
                             if sync_stats["status"] == "synced":
                                 st.session_state.df = sync_df
                                 st.session_state[f"df_{symbol_choice}"] = sync_df
-                                st.toast(f"✅ Master Hub Updated! (+{sync_stats['new_rows']} candles via Yahoo)")
+                                st.toast(f"✅ Master Hub Healed! (+{sync_stats['new_rows']} minutes)")
                         except Exception as yh_err:
                             st.toast(f"ℹ️ Auto-Bridge skipped: {yh_err}")
 
