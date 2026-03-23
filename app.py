@@ -302,18 +302,41 @@ with st.sidebar:
 
     # ── Live Data Sync Panel ─────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("📡 Live Data Sync")
-    st.caption("Connect your local MT5 server to pull only the missing candles.")
+    st.subheader("📡 Live MT5 Sync")
+    
+    # Initialize lock state
+    if "mt5_enabled" not in st.session_state:
+        st.session_state.mt5_enabled = False
 
-    mt5_url = st.text_input("MT5 Server URL",
-                             value=st.session_state.get("mt5_url", "http://localhost:5000"),
-                             key="mt5_url_input",
-                             placeholder="http://localhost:5000")
+    if not st.session_state.mt5_enabled:
+        st.info("MT5 Engine is currently Locked 🔒")
+        if st.button("🔓 Activate MT5 Connection", width="stretch"):
+            st.session_state.mt5_enabled = True
+            st.rerun()
+    else:
+        if st.button("🔒 Lock MT5 Engine", width="stretch"):
+            st.session_state.mt5_enabled = False
+            st.rerun()
+        
+        st.caption("Connect your local MT5 server to pull only the missing candles.")
 
-    mt5_token = st.text_input("MT5 Security Token",
-                               value=st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026"),
-                               type="password",
-                               help="The token configured in your MT5 Data Server.")
+        mt5_url = st.text_input("MT5 Server URL",
+                                 value=st.session_state.get("mt5_url", "http://localhost:5000"),
+                                 key="mt5_url_input",
+                                 placeholder="http://localhost:5000")
+
+        mt5_token = st.text_input("MT5 Security Token",
+                                   value=st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026"),
+                                   type="password")
+        
+        if st.button("🔌 Test Connection", width="stretch"):
+            from data_sync import ping_mt5_server
+            result = ping_mt5_server(mt5_url, mt5_token)
+            if result["reachable"] and result["mt5_initialized"]:
+                st.success("✅ MT5 Connected")
+                st.session_state.mt5_url = mt5_url
+            else:
+                st.error("❌ MT5 Offline")
 
     st.markdown("---")
     data_source_priority = st.radio(
@@ -363,17 +386,21 @@ with st.sidebar:
 
         with col_btn:
             try:
-                if st.button(f"🔄 Sync", key=f"sync_{sym}", width="stretch"):
-                    if not hf_repo or not hf_token:
-                        st.error("Credential Error")
-                    elif not IS_CLOUD and not mt5_url:
-                        st.error("Enter MT5 setup")
-                    else:
-                        from data_sync import sync_symbol
-                        with st.spinner(f"Syncing…"):
-                            updated_df, stats = sync_symbol(hf_repo, sym, hf_token, mt5_url, mt5_token)
-                            st.session_state[f"df_{sym}"] = updated_df
-                            st.success(f"✅ {sym} ok")
+                # ONLY SHOW SYNC BUTTON IF MT5 IS ACTIVATED
+                if st.session_state.get("mt5_enabled", False):
+                    if st.button(f"🔄 Sync", key=f"sync_{sym}", width="stretch"):
+                        if not hf_repo or not hf_token:
+                            st.error("Credential Error")
+                        elif not mt5_url:
+                            st.error("Enter MT5 setup")
+                        else:
+                            from data_sync import sync_symbol
+                            with st.spinner(f"Syncing…"):
+                                updated_df, stats = sync_symbol(hf_repo, sym, hf_token, mt5_url, mt5_token)
+                                st.session_state[f"df_{sym}"] = updated_df
+                                st.success(f"✅ {sym} ok")
+                else:
+                    st.button(f"🔄 Sync (Locked)", key=f"sync_locked_{sym}", width="stretch", disabled=True)
             except Exception as sync_err:
                 st.error("Sync Errored")
 
