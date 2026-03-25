@@ -25,7 +25,97 @@ import quantstats as qs
 import duckdb
 import polars as pl
 import xgboost as xgb
+from datetime import datetime, timezone
+import contextlib
+import io
 from streamlit_autorefresh import st_autorefresh
+
+def execute_generated_code(code, df):
+    """Executes AI-generated Python code within a safe, isolated quant environment."""
+    env = {
+        'st': st, 'pd': pd, 'np': np, 'px': px, 'go': go, 'plt': plt,
+        'sns': sns, 'df': df, 're': re, 'math': math, 'scipy': scipy,
+        'pyg': pyg if PYG_AVAILABLE else None, 'ta': ta, 'sm': sm,
+        'qs': qs, 'duck': duckdb, 'pl': pl, 'alt': alt, 'xgb': xgb,
+        'datetime': datetime, 'timezone': timezone
+    }
+    output = io.StringIO()
+    plt.close('all')
+    with contextlib.redirect_stdout(output):
+        try:
+            exec(code, env)
+            return output.getvalue(), None
+        except Exception as e:
+            return output.getvalue(), str(e)
+
+def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_key="messages", base_url=None):
+    """Handles professional quantitative analysis queries using multi-modal AI reasoning."""
+    if "messages_live" not in st.session_state: st.session_state.messages_live = []
+    if "messages" not in st.session_state: st.session_state.messages = []
+    
+    # Get correct history
+    history = st.session_state[history_key]
+    history.append({"role": "user", "content": prompt})
+    
+    with st.chat_message("user"): st.markdown(prompt)
+    
+    with st.chat_message("assistant"):
+        with st.spinner("AI Analyst is calculating..."):
+            df_info = io.StringIO()
+            df.info(buf=df_info)
+            metadata = df_info.getvalue()
+            
+            system_prompt = f"""
+            You are a Lead Quant in 2026. Use the provided DataFrame 'df' for your analysis.
+            SCHEMA: {metadata}
+            SAMPLES: {df.head(2).to_string()}
+            
+            RULES:
+            1. Provide executable Python code in ```python blocks.
+            2. Explain your reasoning in detail BEFORE the code.
+            3. Use 'st.write()', 'st.plotly_chart()' for results.
+            """
+            
+            # Robust key/client handling
+            final_key = api_key
+            if model_provider == "NVIDIA" and not final_key.startswith("nvapi-"):
+                final_key = f"nvapi-{final_key}"
+            
+            client = OpenAI(base_url=base_url, api_key=final_key)
+            full_txt = ""
+            ph = st.empty()
+            
+            messages = [{"role": "system", "content": system_prompt}] + history
+            
+            try:
+                stream = client.chat.completions.create(
+                    model=model_choice, messages=messages, temperature=0.2, stream=True
+                )
+                for chunk in stream:
+                    if chunk.choices[0].delta.content:
+                        full_txt += chunk.choices[0].delta.content
+                        ph.markdown(full_txt + "▌")
+                ph.markdown(full_txt)
+                
+                # Execution and Self-Healing
+                code_pattern = r"```python(.*?)```"
+                blocks = re.findall(code_pattern, full_txt, re.S | re.I)
+                final_code = "\n\n".join([b.strip() for b in blocks]) if blocks else None
+                final_stdout = ""
+                
+                if final_code:
+                    final_stdout, error = execute_generated_code(final_code, df)
+                    if error:
+                        st.error(f"Execution Error: {error}")
+                
+                msg_to_store = {"role": "assistant", "content": full_txt}
+                if final_code: msg_to_store["code"] = final_code
+                if final_stdout: msg_to_store["exec_result"] = final_stdout
+                history.append(msg_to_store)
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"API Error: {e}")
 
 # Lazy/Optional Heavy Imports
 try:
@@ -182,7 +272,7 @@ if not check_password():
 with st.sidebar:
     st.header("⚙️ Configuration")
     provider_choice = st.selectbox("Select AI Provider", [
-        "NVIDIA", "Groq", "OpenRouter", "OpenRouter (Free)", "Gemini", "GitHub Models", "Cerebras", "Bytez", "Completions"
+        "NVIDIA", "Groq", "OpenRouter", "OpenRouter (Free)", "Gemini", "GitHub Models", "Cerebras", "Bytez"
     ])
     
     # Leave value empty to prevent dots being shown in the DOM (security measure)
@@ -194,8 +284,6 @@ with st.sidebar:
         secret_key_name = "OPEN_ROUTER_API_KEY"
     elif provider_choice == "GitHub Models":
         secret_key_name = "GITHUB_API_KEY"
-    elif provider_choice == "Completions":
-        secret_key_name = "Completions"
     
     api_key_to_use = input_api_key if input_api_key else st.secrets.get(secret_key_name, "")
     
@@ -265,16 +353,6 @@ with st.sidebar:
             "Qwen/Qwen1.5-72B-Chat"
         ])
         base_url = "https://api.bytez.com/models/v2/openai/"
-    elif provider_choice == "Completions":
-        model_choice = st.selectbox("Select Model", [
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4-turbo",
-            "gpt-3.5-turbo",
-            "claude-3-5-sonnet-20240620",
-            "claude-3-opus-20240229"
-        ])
-        base_url = "https://api.completions.com/v1"
 
     enable_thinking = st.checkbox("Enable Thinking Mode", value=True)
     show_debug = st.checkbox("Show AI Trace (Debug)", value=False)
@@ -312,118 +390,30 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    # ── Live Data Sync Panel ─────────────────────────────────────────────
+    # ── Cloud Data Management ──
     st.markdown("---")
-    st.subheader("📡 Live MT5 Sync")
-    
-    # Initialize lock state
-    if "mt5_enabled" not in st.session_state:
-        st.session_state.mt5_enabled = False
-
-    if not st.session_state.mt5_enabled:
-        st.info("MT5 Engine is currently Locked 🔒")
-        if st.button("🔓 Activate MT5 Connection", width="stretch"):
-            st.session_state.mt5_enabled = True
-            st.rerun()
-    else:
-        if st.button("🔒 Lock MT5 Engine", width="stretch"):
-            st.session_state.mt5_enabled = False
-            st.rerun()
-        
-        st.caption("Connect your local MT5 server to pull only the missing candles.")
-
-        mt5_url = st.text_input("MT5 Server URL",
-                                 value=st.session_state.get("mt5_url", "http://localhost:5000"),
-                                 key="mt5_url_input",
-                                 placeholder="http://localhost:5000")
-
-        mt5_token = st.text_input("MT5 Security Token",
-                                   value=st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026"),
-                                   type="password")
-        
-        if st.button("🔌 Test Connection", width="stretch"):
-            from data_sync import ping_mt5_server
-            result = ping_mt5_server(mt5_url, mt5_token)
-            if result["reachable"] and result["mt5_initialized"]:
-                st.success("✅ MT5 Connected")
-                st.session_state.mt5_url = mt5_url
-            else:
-                st.error("❌ MT5 Offline")
-
-    st.markdown("---")
+    st.subheader("🌐 Data Strategy")
     data_source_priority = st.radio(
-        "🌐 **Default Data Source**",
+        "Default Data Source",
         ["☁️ Cloud Hub (Hugging Face)", "💾 Local Disk (.parquet)"],
         index=0,
         help="Choose where the 'Load' button looks first."
     )
     st.session_state.data_source_priority = data_source_priority
 
-    if st.button("🔌 Test MT5 Connection", width="stretch"):
-        from data_sync import ping_mt5_server
-        result = ping_mt5_server(mt5_url, mt5_token)
-        if result["reachable"] and result["mt5_initialized"]:
-            st.success("✅ MT5 Server Connected & Ready")
-            st.session_state.mt5_url = mt5_url
-        elif result["reachable"]:
-            st.warning("⚠️ Server running but MT5 not initialized yet")
-        else:
-            st.error("❌ Cannot reach server. Is mt5_data_server.py running?")
-
-    st.markdown("---")
-
-    # Per-symbol sync buttons
+    # Simple freshness display (Optional but nice for sidebar)
+    # --- ⚡ AUTO-SYNC & CREDENTIALS ---
     hf_repo  = st.secrets.get("HF_REPO_ID", "")
     hf_token = st.secrets.get("HuggingFace_API_KEY", "")
+    mt5_url = st.session_state.get("mt5_url", "http://localhost:5000")
+    mt5_token = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
 
-    for sym in ["XAUUSD", "EURUSD"]:
-        col_label, col_btn = st.columns([3, 2])
-        with col_label:
-            # Show data freshness if parquet is loaded
-            try:
-                if f"df_{sym}" in st.session_state:
-                    from data_sync import get_gap_info
-                    gap = get_gap_info(st.session_state[f"df_{sym}"])
-                    if gap.get("gap_hours", 0) < 1:
-                        st.caption(f"🟢 {sym} — Fresh")
-                    elif gap.get("gap_hours", 0) < 24:
-                        st.caption(f"🟡 {sym} — {gap['label']}")
-                    else:
-                        st.caption(f"🔴 {sym} — {gap['label']}")
-                else:
-                    st.caption(f"📊 {sym} — not loaded")
-            except Exception as loop_err:
-                st.caption(f"📊 {sym} (Status error)")
-                # Don't crash the sidebar even if status check fails
-
-        with col_btn:
-            try:
-                # ONLY SHOW SYNC BUTTON IF MT5 IS ACTIVATED
-                if st.session_state.get("mt5_enabled", False):
-                    if st.button(f"🔄 Sync", key=f"sync_{sym}", width="stretch"):
-                        if not hf_repo or not hf_token:
-                            st.error("Credential Error")
-                        elif not mt5_url:
-                            st.error("Enter MT5 setup")
-                        else:
-                            from data_sync import sync_symbol
-                            with st.spinner(f"Syncing…"):
-                                updated_df, stats = sync_symbol(hf_repo, sym, hf_token, mt5_url, mt5_token)
-                                st.session_state[f"df_{sym}"] = updated_df
-                                st.success(f"✅ {sym} ok")
-                else:
-                    st.button(f"🔄 Sync (Locked)", key=f"sync_locked_{sym}", width="stretch", disabled=True)
-            except Exception as sync_err:
-                st.error("Sync Errored")
-
-    # --- ⚡ AUTO-SYNC CONTROLLER ---
     st.markdown("---")
     st.subheader("⚡ Auto-Sync Mode")
     auto_sync_on = st.toggle("Enable Auto-Sync 📡", value=st.session_state.get("auto_sync_on", False))
     st.session_state.auto_sync_on = auto_sync_on
 
     if auto_sync_on:
-        from streamlit_autorefresh import st_autorefresh
         sync_interval = st.selectbox("Frequency ⏱️", [1, 5, 15, 30, 60], index=2, format_func=lambda x: f"Every {x} min")
         refresh_count = st_autorefresh(interval=sync_interval * 60 * 1000, key="sync_counter")
         
@@ -631,429 +621,272 @@ def execute_generated_code(code, df):
 # Main Application
 st.title("🏛️ NVIDIA NIM Professional Quant Station")
 
-st.markdown("### 📥 Select Dataset & Range")
-colA, colD, colB, colC = st.columns([1.5, 1.5, 2, 1])
-with colA:
-    symbol_choice = st.selectbox(
-        "Select Symbol", 
-        ["XAUUSD", "EURUSD", "DXY"],
-        label_visibility="collapsed"
-    )
-with colD:
-    lookback_choice = st.selectbox(
-        "Lookback Period",
-        ["Last 7 Days", "Last 30 Days", "Last 3 Months", "Last 6 Months", "1 Year", "All Data"],
-        index=1,
-        help="Select how much data to load into the UI to save memory.",
-        label_visibility="collapsed"
-    )
-with colB:
-    if st.button(f"🚀 Load {symbol_choice} Data", width="stretch"):
-        st.session_state.current_symbol_view = symbol_choice
-        source = st.session_state.get("data_source_priority", "☁️ Cloud Hub")
-        load_success = False
-        hf_rows_before = 0
+# --- MASTER MODE SWITCHER ---
+st.markdown("---")
+view_mode = st.radio(
+    "Choose Analysis Data Source",
+    ["🗄️ Historical Vault (Hugging Face)", "📡 Live MT5 Feed (Direct Broker)"],
+    horizontal=True,
+    help="Switch between deep historical archives and real-time broker data."
+)
+st.markdown("---")
 
-        # ── STEP 1: Fetch existing data from Hugging Face Hub ───────────────
-        if "Cloud Hub" in source:
-            if hf_repo and hf_token:
-                from data_sync import load_from_hf
-                with st.spinner(f"📥 Step 1/3 — Fetching existing data for {symbol_choice} from Hugging Face Hub..."):
-                    try:
-                        hub_df = load_from_hf(hf_repo, symbol_choice, hf_token)
-                        hf_rows_before = len(hub_df)
-                        st.session_state.df = hub_df
-                        st.session_state[f"df_{symbol_choice}"] = hub_df
-                        st.session_state.file_name = f"Cloud_{symbol_choice}_Data"
-                        st.info(f"☁️ Loaded **{hf_rows_before:,} rows** from Hugging Face Hub.")
-                        load_success = True
-                    except Exception as e:
-                        st.warning(f"⚠️ Cloud Hub fetch failed: {e}. Trying local disk...")
+if "Historical" in view_mode:
+    st.markdown("### 📥 Select Archive Dataset")
+    colA, colD, colB, colC = st.columns([1.5, 1.5, 2, 1])
+    with colA:
+        symbol_choice = st.selectbox(
+            "Select Symbol", 
+            ["XAUUSD", "EURUSD", "DXY"],
+            label_visibility="collapsed"
+        )
+    with colD:
+        lookback_choice = st.selectbox(
+            "Lookback Period",
+            ["Last 7 Days", "Last 30 Days", "Last 3 Months", "Last 6 Months", "1 Year", "All Data"],
+            index=1,
+            help="Select how much data to load into the UI to save memory.",
+            label_visibility="collapsed"
+        )
+    with colB:
+        if st.button(f"🚀 Load {symbol_choice} Data", width="stretch"):
+            st.session_state.current_symbol_view = symbol_choice
+            source = st.session_state.get("data_source_priority", "☁️ Cloud Hub")
+            load_success = False
+            hf_rows_before = 0
 
-        # Fallback to local disk
-        if not load_success:
-            import os
-            filename = f"{symbol_choice}_M1_Data.parquet"
-            if os.path.exists(filename):
-                with st.spinner(f"Loading {filename} from local disk..."):
-                    try:
-                        disk_df = pd.read_parquet(filename)
-                        hf_rows_before = len(disk_df)
-                        st.session_state.df = disk_df
-                        st.session_state.file_name = filename
-                        st.info(f"💾 Loaded **{hf_rows_before:,} rows** from local disk.")
-                        load_success = True
-                    except Exception as e:
-                        st.warning(f"⚠️ Local file error: {e}")
+            # ── STEP 1: Fetch existing data from Hugging Face Hub ───────────────
+            if "Cloud Hub" in source:
+                if hf_repo and hf_token:
+                    from data_sync import load_from_hf
+                    with st.spinner(f"📥 Step 1/3 — Fetching existing data for {symbol_choice} from Hugging Face Hub..."):
+                        try:
+                            hub_df = load_from_hf(hf_repo, symbol_choice, hf_token)
+                            hf_rows_before = len(hub_df)
+                            st.session_state.df = hub_df
+                            st.session_state[f"df_{symbol_choice}"] = hub_df
+                            st.session_state.file_name = f"Cloud_{symbol_choice}_Data"
+                            st.info(f"☁️ Loaded **{hf_rows_before:,} rows** from Hugging Face Hub.")
+                            load_success = True
+                        except Exception as e:
+                            st.warning(f"⚠️ Cloud Hub fetch failed: {e}. Trying local disk...")
 
-        if not load_success:
-            st.error(f"❌ No data found for {symbol_choice} on Hugging Face Hub OR Local Disk!")
-        else:
-            current_df = st.session_state.df
+            # Fallback to local disk
+            if not load_success:
+                import os
+                filename = f"{symbol_choice}_M1_Data.parquet"
+                if os.path.exists(filename):
+                    with st.spinner(f"Loading {filename} from local disk..."):
+                        try:
+                            disk_df = pd.read_parquet(filename)
+                            hf_rows_before = len(disk_df)
+                            st.session_state.df = disk_df
+                            st.session_state.file_name = filename
+                            st.info(f"💾 Loaded **{hf_rows_before:,} rows** from local disk.")
+                            load_success = True
+                        except Exception as e:
+                            st.warning(f"⚠️ Local file error: {e}")
 
-            # ── STEP 2: Detect gap & fetch new data ─────────────────────────
-            from data_sync import get_gap_info
-            gap = get_gap_info(current_df)
-
-            if gap["gap_hours"] <= 0.25:
-                st.success(f"✅ {symbol_choice} data is already fresh ({gap['label']}). No sync needed.")
-            elif symbol_choice in YAHOO_MAPPING:
-                target_yh = YAHOO_MAPPING[symbol_choice]
-                st.info(f"🕐 Gap detected: **{gap['label']}**. Fetching new candles from Yahoo Finance ({target_yh})...")
-
-                with st.spinner(f"📡 Step 2/3 — Fetching new {symbol_choice} candles (last 7 days) from Yahoo Finance..."):
-                    try:
-                        from data_sync import sync_yahoo_symbol
-                        # sync_yahoo_symbol already:
-                        #   1. Fetches new data from Yahoo
-                        #   2. Loads existing from HF Hub
-                        #   3. Merges (dedup + sort)
-                        #   4. Pushes the merged result back to HF Hub
-                        sync_df, sync_stats = sync_yahoo_symbol(
-                            hf_repo, target_yh, hf_token,
-                            existing_df=current_df   # ← pass already-loaded HF data; skips redundant re-download
-                        )
-
-                        hf_rows_after = len(sync_df)
-                        new_rows_added = hf_rows_after - hf_rows_before
-
-                        # ── STEP 3: Update session with merged result ────────
-                        st.session_state.df = sync_df
-                        st.session_state[f"df_{symbol_choice}"] = sync_df
-
-                        st.success(
-                            f"✅ Step 3/3 — Merge complete & pushed back to Hugging Face Hub!\n\n"
-                            f"- **Rows on Hub before sync:** {hf_rows_before:,}\n"
-                            f"- **New rows fetched & merged:** +{new_rows_added:,}\n"
-                            f"- **Total rows now on Hub:** {hf_rows_after:,}"
-                        )
-                        st.toast(f"🚀 {symbol_choice} synced! +{new_rows_added:,} new rows pushed to Hub.")
-                        
-                        # Use the freshly synced dataframe as our current_df
-                        current_df = sync_df
-
-                    except Exception as yh_err:
-                        st.warning(f"⚠️ Auto-sync skipped (Yahoo Finance unreachable or no new data): {yh_err}")
-                        st.info("Displaying existing Hub data as-is.")
+            if not load_success:
+                st.error(f"❌ No data found for {symbol_choice} on Hugging Face Hub OR Local Disk!")
             else:
-                st.warning(f"⚠️ Gap of **{gap['label']}** detected but no Yahoo Finance mapping for {symbol_choice}. Use MT5 Sync instead.")
+                current_df = st.session_state.df
 
-            # ── STEP 4: Apply memory-safe lookback filter ────────────────────────
-            time_cols = [c for c in current_df.columns if 'time' in c.lower() or 'date' in c.lower()]
-            if time_cols and lookback_choice != "All Data":
-                time_col = time_cols[0]
-                current_df[time_col] = pd.to_datetime(current_df[time_col], utc=True, errors='coerce')
-                max_time = current_df[time_col].max()
-                
-                if lookback_choice == "Last 7 Days":
-                    cutoff = max_time - pd.Timedelta(days=7)
-                elif lookback_choice == "Last 30 Days":
-                    cutoff = max_time - pd.Timedelta(days=30)
-                elif lookback_choice == "Last 3 Months":
-                    cutoff = max_time - pd.Timedelta(days=90)
-                elif lookback_choice == "Last 6 Months":
-                    cutoff = max_time - pd.Timedelta(days=180)
-                elif lookback_choice == "1 Year":
-                    cutoff = max_time - pd.Timedelta(days=365)
-                
-                # Filter down to save memory
-                memory_safe_df = current_df[current_df[time_col] >= cutoff].reset_index(drop=True)
-                st.session_state.df = memory_safe_df
-                st.session_state[f"df_{symbol_choice}"] = memory_safe_df
-                st.info(f"✂️ UI Memory Safe Mode: Loaded **{len(memory_safe_df):,}** rows ({lookback_choice}) out of **{len(current_df):,}** total.)")
-            else:
-                # User chose "All Data" (or time col not found)
-                st.session_state.df = current_df
-                st.session_state[f"df_{symbol_choice}"] = current_df
-                st.info(f"⚠️ Loaded FULL dataset into UI memory: **{len(current_df):,}** rows.")
+                # ── STEP 2: Detect gap & fetch new data ─────────────────────────
+                from data_sync import get_gap_info
+                gap = get_gap_info(current_df)
 
+                if gap["gap_hours"] <= 0.25:
+                    st.success(f"✅ {symbol_choice} data is already fresh ({gap['label']}). No sync needed.")
+                elif symbol_choice in YAHOO_MAPPING:
+                    target_yh = YAHOO_MAPPING[symbol_choice]
+                    st.info(f"🕐 Gap detected: **{gap['label']}**. Fetching new candles from Yahoo Finance ({target_yh})...")
+
+                    with st.spinner(f"📡 Step 2/3 — Fetching new {symbol_choice} candles (last 7 days) from Yahoo Finance..."):
+                        try:
+                            from data_sync import sync_yahoo_symbol
+                            # sync_yahoo_symbol already:
+                            #   1. Fetches new data from Yahoo
+                            #   2. Loads existing from HF Hub
+                            #   3. Merges (dedup + sort)
+                            #   4. Pushes the merged result back to HF Hub
+                            sync_df, sync_stats = sync_yahoo_symbol(
+                                hf_repo, target_yh, hf_token,
+                                existing_df=current_df   # ← pass already-loaded HF data; skips redundant re-download
+                            )
+
+                            hf_rows_after = len(sync_df)
+                            new_rows_added = hf_rows_after - hf_rows_before
+
+                            # ── STEP 3: Update session with merged result ────────
+                            st.session_state.df = sync_df
+                            st.session_state[f"df_{symbol_choice}"] = sync_df
+
+                            # Build detailed report
+                            report = (
+                                f"✅ **Merge Successful & Pushed to Hub!**\n\n"
+                                f"- **Rows Before:** {hf_rows_before:,}  (Last candle: {gap.get('last_timestamp', 'Unknown')})\n"
+                                f"- **Delta Fetched:** +{new_rows_added:,} new rows\n"
+                                f"- **Sync Range:** {sync_df['time'].iloc[-(new_rows_added+1)] if new_rows_added > 0 else 'N/A'} → {sync_df['time'].iloc[-1]}\n"
+                                f"- **Total Rows now on Hub:** {hf_rows_after:,}"
+                            )
+                            st.success(report)
+                            st.toast(f"🚀 {symbol_choice} synced! +{new_rows_added:,} rows.")
+                            
+                            # Use the freshly synced dataframe as our current_df
+                            current_df = sync_df
+
+                        except Exception as yh_err:
+                            st.warning(f"⚠️ Auto-sync skipped (Yahoo Finance unreachable or no new data): {yh_err}")
+                            st.info("Displaying existing Hub data as-is.")
+                else:
+                    st.warning(f"⚠️ Gap of **{gap['label']}** detected but no Yahoo Finance mapping for {symbol_choice}. Use MT5 Sync instead.")
+
+                # ── STEP 4: Apply memory-safe lookback filter ────────────────────────
+                time_cols = [c for c in current_df.columns if 'time' in c.lower() or 'date' in c.lower()]
+                if time_cols and lookback_choice != "All Data":
+                    time_col = time_cols[0]
+                    current_df[time_col] = pd.to_datetime(current_df[time_col], utc=True, errors='coerce')
+                    max_time = current_df[time_col].max()
+                    
+                    if lookback_choice == "Last 7 Days":
+                        cutoff = max_time - pd.Timedelta(days=7)
+                    elif lookback_choice == "Last 30 Days":
+                        cutoff = max_time - pd.Timedelta(days=30)
+                    elif lookback_choice == "Last 3 Months":
+                        cutoff = max_time - pd.Timedelta(days=90)
+                    elif lookback_choice == "Last 6 Months":
+                        cutoff = max_time - pd.Timedelta(days=180)
+                    elif lookback_choice == "1 Year":
+                        cutoff = max_time - pd.Timedelta(days=365)
+                    
+                    # Filter down to save memory
+                    memory_safe_df = current_df[current_df[time_col] >= cutoff].reset_index(drop=True)
+                    st.session_state.df = memory_safe_df
+                    st.session_state[f"df_{symbol_choice}"] = memory_safe_df
+                    st.info(f"✂️ UI Memory Safe Mode: Loaded **{len(memory_safe_df):,}** rows ({lookback_choice}) out of **{len(current_df):,}** total.)")
+                else:
+                    # User chose "All Data" (or time col not found)
+                    st.session_state.df = current_df
+                    st.session_state[f"df_{symbol_choice}"] = current_df
+                    st.info(f"⚠️ Loaded FULL dataset into UI memory: **{len(current_df):,}** rows.")
+
+                st.session_state.messages = []
+                st.rerun()
+
+    with colC:
+        if st.button("🧹 Clear Workspace", width="stretch"):
+            if 'df' in st.session_state: del st.session_state['df']
+            if 'df_live' in st.session_state: del st.session_state['df_live']
             st.session_state.messages = []
+            st.session_state.messages_live = []
             st.rerun()
 
-with colC:
-    if st.button("🧹 Clear Dataset", width="stretch"):
-        if 'df' in st.session_state:
-            del st.session_state['df']
-        st.session_state.messages = []
-        st.rerun()
-
-# File uploader (Fallback)
-uploaded_file = st.file_uploader("Or manually upload a CSV or Parquet dataset file", type=['csv', 'parquet'])
-
-if uploaded_file is not None:
-    if 'df' not in st.session_state or st.session_state.file_name != uploaded_file.name:
-        with st.spinner("Optimizing data..."):
-            st.session_state.df = process_data(uploaded_file)
-            st.session_state.file_name = uploaded_file.name
-            st.session_state.messages = []
-            st.success("Professional environment initialized!")
-
-if 'df' in st.session_state and st.session_state.df is not None:
-    # Use reference instead of full copy to save memory (especially on 1.8M row datasets)
-    df_raw = st.session_state.df
-    df = df_raw  # Default to full
-
-    # --- DATE RANGE FILTERING ---
-    time_cols = [c for c in df_raw.columns if 'time' in c.lower() or 'date' in c.lower()]
-    if time_cols:
-        main_time_col = time_cols[0]
-        # Extract time series for filtering without coercing the dataframe itself
-        times = pd.to_datetime(df_raw[main_time_col], errors='coerce')
-        valid_dates = times.dropna()
-        if not valid_dates.empty:
-            st.markdown("### 📅 Filter Data by Date")
-            min_date = valid_dates.min().date()
-            max_date = valid_dates.max().date()
-
-            selected_dates = st.date_input(
-                f"Select Range ({main_time_col})", 
-                value=[min_date, max_date], 
-                min_value=min_date, 
-                max_value=max_date
-            )
-
-            if len(selected_dates) == 2:
-                start_date, end_date = selected_dates
-                mask = (times.dt.date >= start_date) & (times.dt.date <= end_date)
-                df = df_raw.loc[mask]
-                st.info(f"✅ Filtered to {len(df):,} rows (from {start_date} to {end_date}).")
-
-
-    # TABBED NAVIGATION
-    tab1, tab2, tab3 = st.tabs(["💬 AI Analyst", "🔍 Visual Explorer", "📋 Interactive Data Grid"])
-
-    with tab1:
-        st.subheader("🤖 AI Data Analyst")
-        with st.expander("📊 Data Preview & Schema", expanded=True):
-            st.dataframe(make_arrow_safe(df.head()), width="stretch")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.write("Column Types:")
-                # Avoid Arrow error: df.dtypes has dtype objects PyArrow can't serialize
-                dtypes_df = pd.DataFrame({"Column": df.columns, "Type": [str(t) for t in df.dtypes]})
-                st.dataframe(make_arrow_safe(dtypes_df), width="stretch", hide_index=True)
-            with col2:
-                st.write("Basic Stats:")
-                st.dataframe(make_arrow_safe(df.describe()), width="stretch")
-
-        if "messages" not in st.session_state:
-            st.session_state.messages = []
-
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-                if "code" in message:
-                    with st.expander("View Code"): st.code(message["code"])
-                    # Re-execute code on each render so charts/tables appear (Streamlit loses them on rerun)
-                    stdout, error = execute_generated_code(message["code"], df)
-                    if error:
-                        st.error(f"⚠️ Error: {error}")
-                    if stdout and stdout.strip():
-                        st.markdown("**Output:**")
-                        st.text(stdout)
-                elif "exec_result" in message:
-                    st.markdown(message["exec_result"])
-
-        # --- QUANT PROMPT LIBRARY ---
-        st.markdown("---")
-        with st.expander("💡 **Quant Prompt Library** (One-Click Analysis)", expanded=False):
-            st.info("Select a professional analysis template below to instantly generate a quantitative report.")
+    # --- HISTORICAL ANALYSIS TABS (Only if data loaded) ---
+    if 'df' in st.session_state and st.session_state.df is not None:
+        df = st.session_state.df
+        h_tab1, h_tab2, h_tab3 = st.tabs(["💬 AI Analyst", "🔍 Visual Explorer", "📋 Data Grid"])
+        
+        with h_tab1:
+            st.subheader("🤖 AI Data Analyst (Historical)")
+            with st.expander("📊 Data Preview & Schema", expanded=True):
+                st.dataframe(make_arrow_safe(df.head()), width="stretch")
             
-            st.markdown("##### 📌 Standard Analysis")
-            prompt_cols = st.columns(2)
-            with prompt_cols[0]:
-                if st.button("📈 Target Escalation Matrix"):
-                    st.session_state.pending_prompt = "Analyze moves that reach $10 (100 points). Calculate the probability of them extending to $15 and $20 using $2.5 bins before a 30% reversal occur. Show results in a clean table and a probability bar chart."
-                if st.button("🌍 Session Volatility Profile"):
-                    st.session_state.pending_prompt = "Break down the average 'DifferencePoints' and 'DifferencePercent' by trading session (CrossoverStartSession). Identify which session has the highest volatility and show a distribution plot formatted for a quant presentation."
-            with prompt_cols[1]:
-                if st.button("🔄 Mean Reversion Diagnostic"):
-                    st.session_state.pending_prompt = "For all moves exceeding $12, what is the 'YES' vs 'NO' rate for 'ReversalTriggered'? Show the average time taken for a reversal (ReversalTime - AbsolutePeakTime) per session in a summary table."
-                if st.button("⏱️ Wave Life-Cycle Analysis"):
-                    st.session_state.pending_prompt = "Calculate the average time in minutes from CrossoverStartTime to AbsolutePeakTime for each session. Show a comparative horizontal bar chart and highlight the session where price peaks the fastest."
+            # Historical Chat history
+            if "messages" not in st.session_state: st.session_state.messages = []
+            for m in st.session_state.messages:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"])
+                    if "code" in m:
+                        with st.expander("Show Code"): st.code(m["code"])
+                        execute_generated_code(m["code"], df)
+            
+            if prompt := st.chat_input("Analyze the archive...", key="hist_chat"):
+                process_ai_query(prompt, df, model_choice, api_key_to_use, provider_choice, history_key="messages", base_url=base_url)
 
-            st.markdown("---")
-            st.markdown("##### 🔬 Deep Retracement Analysis (New)")
-            deep_cols = st.columns(2)
-            with deep_cols[0]:
-                if st.button("🔻 Crossover Funnel Report"):
-                    st.session_state.pending_prompt = "Build a conversion funnel analysis: First count total crossovers. Then count how many had DifferencePoints >= 10 (crossed the $10 threshold). Then count how many of those had ReversalTriggered = YES. Show as a funnel table AND a bar chart with counts and conversion % at each step. Break it down by CrossoverStartSession."
-                if st.button("📊 True Depth Distribution"):
-                    st.session_state.pending_prompt = "For all waves where ReversalTriggered is YES, calculate the TRUE retracement percentage using the formula: true_retrace_pct = (ImpulsePeakPrice - DeepestRetracePrice) / (ImpulsePeakPrice - CrossoverStartPrice) * 100. Bin these results into: 30-40%, 40-60%, 60-80%, 80-100%, and 100%+. Show as a stacked bar chart broken down by CrossoverStartSession. This tells us how deep the market ACTUALLY went beyond the 30% trigger."
-            with deep_cols[1]:
-                if st.button("🛡️ Shallow vs Deep Reversal Outcome"):
-                    st.session_state.pending_prompt = "For all waves where ReversalTriggered is YES, calculate true_retrace_pct = (ImpulsePeakPrice - DeepestRetracePrice) / (ImpulsePeakPrice - CrossoverStartPrice) * 100. Split into Shallow (30-50%) and Deep (50%+). For each group, show: 1) How many had AbsolutePeakPrice > ImpulsePeakPrice (trend survived and made new high), 2) Average DifferencePoints, 3) Distribution by session. Show as a side-by-side comparison table and chart."
-                
-                if st.button("🎯 Session Target Range"):
-                    st.session_state.pending_prompt = "Filter rows where ReversalTriggered is YES. For BULL calculate Move=ImpulsePeakPrice-CrossoverStartPrice, for BEAR calculate Move=CrossoverStartPrice-ImpulsePeakPrice. Show average, median, min, max Move grouped by CrossoverStartSession. This tells us typical extension after $10 crossover but BEFORE the 30% reversal trigger. Show as a distribution box plot by session."
+        with h_tab2:
+            st.subheader("📊 Visual Explorer")
+            if PYG_AVAILABLE:
+                st.components.v1.html(pyg.to_html(make_arrow_safe(df.tail(100000))), height=800, scrolling=True)
+            else: st.info("PyGWalker unavailable on this instance.")
 
-        # Handle button clicks from library
-        prompt = st.chat_input("Ask for analysis, code, or charts...")
-        if "pending_prompt" in st.session_state:
-            prompt = st.session_state.pending_prompt
-            del st.session_state.pending_prompt
+        with h_tab3:
+            st.subheader("📋 Data Grid")
+            st.dataframe(make_arrow_safe(df.tail(1000)))
+    else:
+        st.info("👋 Master Source: **Historical Vault** selected. Please load a dataset above to start analysis.")
 
-        if prompt:
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"): st.markdown(prompt)
-
-            if not api_key_to_use: st.warning("Missing API Key. Please enter your key in the sidebar.")
-            else:
-                with st.chat_message("assistant"):
-                    df_info = io.StringIO()
-                    df.info(buf=df_info)
-                    metadata = df_info.getvalue()
-                    
-                    system_prompt = f"""
-                    You are a Lead Quant Analyst in 2026. Use the provided DataFrame 'df' to answer the user's question.
-                    
-                    TOOLS AVAILABLE:
-                    - pandas_ta (as ta): Technical indicators.
-                    - quantstats (as qs): Financial performance reports.
-                    - statsmodels (as sm): Econometric tests.
-                    - pygwalker (as pyg): For visual explorers (use pyg.walk(df)).
-                    - math, scipy, sklearn, numpy, polars (as pl), duckdb (as duck), xgboost (as xgb).
-                    
-                    DATAFRAME SCHEMA:
-                    {metadata}
-                    
-                    DATA SAMPLES:
-                    {df.head(3).to_string()}
-                    
-                    RULES:
-                    1. Provide ONLY executable Python code within ```python blocks for analysis.
-                    2. Use 'st.write()', 'st.pyplot()', or 'st.plotly_chart()' for visual outputs.
-                    3. Assume 'df' is already defined.
-                    4. IMPORTANT: Always explain your reasoning BEFORE the code block.
-                    """
-                    
-                    if show_debug:
-                        with st.expander("🔍 RAW AI PROMPT", expanded=False):
-                            st.json({"role": "system", "content": system_prompt})
-                            st.json(st.session_state.messages)
-                    
-                    def get_ai_response(msgs):
-                        full_txt = ""
-                        ph = st.empty()
-                        try:
-                            # Robust key handling
-                            final_key = api_key_to_use
-                            if provider_choice == "NVIDIA" and not final_key.startswith("nvapi-"):
-                                final_key = f"nvapi-{final_key}"
-                            
-                            client = OpenAI(base_url=base_url, api_key=final_key)
-                            print(f"DEBUG: Starting stream with model {model_choice}...")
-                            
-                            extra_kwargs = {}
-                            if provider_choice == "NVIDIA" and enable_thinking:
-                                extra_kwargs = {"chat_template_kwargs": {"enable_thinking": True}}
-
-                            stream = client.chat.completions.create(
-                                model=model_choice,
-                                messages=msgs,
-                                temperature=0.2,
-                                top_p=0.7,
-                                max_tokens=16384,
-                                stream=True,
-                                extra_body=extra_kwargs if extra_kwargs else None
-                            )
-                            
-                            for chunk in stream:
-                                if chunk.choices[0].delta.content is not None:
-                                    delta = chunk.choices[0].delta.content
-                                    full_txt += delta
-                                    ph.markdown(full_txt + "▌")
-                            
-                            ph.markdown(full_txt)
-                            print(f"DEBUG: Stream finished. Length: {len(full_txt)}")
-                            return full_txt
-                        except Exception as e:
-                            print(f"DEBUG: OpenAI Client Error: {e}")
-                            st.error(f"API Error: {e}")
-                            return f"ERROR: {e}"
-
-                    # Initial Chat
-                    current_msgs = [{"role": "system", "content": system_prompt}] + st.session_state.messages
-                    
-                    with st.spinner("AI Analyst is thinking..."):
-                        ai_text = get_ai_response(current_msgs)
-                    
-                    if show_debug:
-                        with st.expander("🔍 RAW AI RESPONSE", expanded=False):
-                            st.text(ai_text)
-                    
-                    # Self-Healing Loop (Max 2 attempts)
-                    final_code = None
-                    final_stdout = ""
-                    
-                    for attempt in range(2):
-                        # Extracting ALL code blocks
-                        code_pattern = r"```python(.*?)```"
-                        blocks = re.findall(code_pattern, ai_text, re.S | re.I)
-                        
-                        if blocks:
-                            full_code_to_run = "\n\n".join([b.strip() for b in blocks])
-                            print(f"DEBUG: Code extracted. Attempt {attempt+1}")
-                            stdout, error = execute_generated_code(full_code_to_run, df)
-                            
-                            if error:
-                                print(f"DEBUG: Execution Error: {error}")
-                                st.warning(f"⚠️ Attempt {attempt+1} failed with error: {error}. Auto-healing...")
-                                heal_prompt = f"The previous code failed with this error: {error}. Please fix the code and try again. Provide ONLY the corrected code."
-                                current_msgs.append({"role": "assistant", "content": ai_text})
-                                current_msgs.append({"role": "user", "content": heal_prompt})
-                                with st.spinner(f"AI is repairing code (Attempt {attempt+2})..."):
-                                    ai_text = get_ai_response(current_msgs)
-                            else:
-                                print(f"DEBUG: Execution Successful!")
-                                final_code = full_code_to_run
-                                final_stdout = stdout
-                                break
-                        else:
-                            print("DEBUG: No code blocks found in AI response.")
-                            break
-                    
-                    # Store final result
-                    msg_to_store = {"role": "assistant", "content": ai_text}
-                    if final_code:
-                        msg_to_store["code"] = final_code
-                    if final_stdout:
-                        msg_to_store["exec_result"] = final_stdout
-                    
-                    st.session_state.messages.append(msg_to_store)
+elif "Live" in view_mode:
+    st.markdown("### 📡 Live MT5 Broker Terminal")
+    
+    # ── STEP 1: Broker Bridge Connection Gate ────────────────────────────
+    is_connected = st.session_state.get("mt5_connected", False)
+    with st.expander("🔒 MT5 Broker Gate (Local Connection Settings)", expanded=not is_connected):
+        c1, c2 = st.columns(2)
+        with c1:
+            mt5_url_in = st.text_input("MT5 Server URL", 
+                                     value=st.session_state.get("mt5_url", "http://localhost:5000"), 
+                                     placeholder="http://localhost:5000",
+                                     key="live_mt5_url")
+        with c2:
+            mt5_tok_in = st.text_input("Security Token", 
+                                     value=st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026"), 
+                                     type="password",
+                                     key="live_mt5_token")
+            
+        if st.button("🔌 Establish Broker Bridge", width="stretch"):
+            from data_sync import ping_mt5_server
+            with st.spinner("Pinging local server..."):
+                res = ping_mt5_server(mt5_url_in, mt5_tok_in)
+                if res["reachable"] and res["mt5_initialized"]:
+                    st.session_state.mt5_connected = True
+                    st.session_state.mt5_url = mt5_url_in
+                    st.success("✅ Bridge Established! Terminal Unlocked.")
                     st.rerun()
+                else:
+                    st.session_state.mt5_connected = False
+                    st.error("❌ Connection Failed. Ensure 'mt5_data_server.py' is running locally.")
 
-    with tab2:
-        st.subheader("📊 Drag-and-Drop Visual Explorer")
-        if PYG_AVAILABLE:
-            if len(df) > 200000:
-                st.warning(f"⚠️ Dataset is very large ({len(df):,} rows). Truncating to the latest 200,000 rows for the Visual Explorer to prevent the browser from crashing.")
-                viz_df = df.tail(200000)
-            else:
-                viz_df = df
+    # ── STEP 2: Main Terminal (Only if bridge is active) ──────────────────
+    if st.session_state.get("mt5_connected"):
+        st_col1, st_col2, st_col3 = st.columns([2, 1, 2])
+        with st_col1: l_sym = st.selectbox("Symbol", ["XAUUSD", "EURUSD", "DXY"], key="l_sym")
+        with st_col2: l_tf = st.selectbox("TF", ["1m", "5m", "15m", "1h"], key="l_tf")
+        with st_col3: 
+            st.write("")
+            live_active = st.toggle("Enable Continuous Feed 📡", value=False)
+
+        if st.button("🔄 Start/Sync Live Feed") or live_active:
+            from data_sync import pull_mt5_window
+            m_url = st.session_state.get("live_mt5_url", "http://localhost:5000")
+            m_tok = st.session_state.get("live_mt5_token", st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026"))
+            if live_active: st_autorefresh(interval=60 * 1000, key="live_refresh")
             
-            pyg_html = pyg.to_html(make_arrow_safe(viz_df))
-            st.components.v1.html(pyg_html, height=1000, scrolling=True)
-        else:
-            st.error("PyGWalker is unavailable due to memory constraints on this system.")
-            st.info("You can still use the AI Analyst tab to generate charts via Plotly/Matplotlib.")
+            with st.spinner("Streaming..."):
+                df_l = pull_mt5_window(m_url, l_sym, l_tf, 500, m_tok)
+                if not df_l.empty:
+                    st.session_state.df_live = df_l
+                    st.toast(f"📈 {l_sym} Live Updated: {df_l['time'].iloc[-1].strftime('%H:%M:%S')}")
 
-    with tab3:
-        st.subheader("🗃️ Interactive Data Grid")
-        if AGGRID_AVAILABLE:
-            if len(df) > 50000:
-                st.warning(f"⚠️ Dataset is very large ({len(df):,} rows). Truncating to the latest 50,000 rows for the Data Grid to keep the UI responsive.")
-                grid_df = df.tail(50000)
-            else:
-                grid_df = df
-            AgGrid(make_arrow_safe(grid_df), height=600, theme='alpine', enable_enterprise_modules=False)
-        else:
-            st.error("AgGrid is unavailable (likely not installed or disabled).")
-            # For st.dataframe, Streamlit automatically paginates so it's safe to pass the full dataframe
-            st.dataframe(make_arrow_safe(df))
+        if st.session_state.get("df_live") is not None:
+            live_df = st.session_state.df_live
+            fig = go.Figure(data=[go.Candlestick(x=live_df['time'], open=live_df['open'], high=live_df['high'], low=live_df['low'], close=live_df['close'])])
+            fig.update_layout(title=f"{l_sym} — {l_tf} Real-Time Feed", template="plotly_dark", height=500, margin=dict(l=10,r=10,t=40,b=10))
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.markdown("---")
+            st.subheader("🤖 Live AI Trade Analyst")
+            if "messages_live" not in st.session_state: st.session_state.messages_live = []
+            for m in st.session_state.messages_live:
+                with st.chat_message(m["role"]):
+                    st.markdown(m["content"])
+                    if "code" in m: execute_generated_code(m["code"], live_df)
 
+            if chat_l := st.chat_input("Analyze live price action...", key="live_chat"):
+                process_ai_query(chat_l, live_df, model_choice, api_key_to_use, provider_choice, history_key="messages_live", base_url=base_url)
+    else:
+        st.info("📡 Broker Terminal Locked. Please establish the bridge above to stream live market data.")
 
 else:
-    st.write("👋 Welcome! Please upload your dataset (CSV or Parquet) to start the analysis.")
-    st.info("💡 **Any time-series, financial OHLC data, or custom data is completely supported.** The AI knows how to adapt to your specific dataset.")
+    st.info("👋 Welcome! Please select a Mode above to begin.")
     st.image("https://developer.nvidia.com/sites/default/files/akamai/NVIDIA_NIM_Icon.png", width=100)

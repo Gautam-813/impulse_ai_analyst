@@ -12,17 +12,48 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Annotated
 import re
-import uvicorn
 import os
 import signal
 import sys
+import io
+import socket
+import uvicorn
+
+# Optional Quant libraries for advanced analytic endpoints
+try:
+    import mplfinance as mpf
+except ImportError:
+    pass
 
 # ============================================================================
-# Interactive Startup Configuration
+# Dynamic Server Metadata
 # ============================================================================
+def get_network_ip():
+    """Detect the primary network IP of this machine."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Doesn't need real connectivity, just triggers OS to resolve local interface
+        s.connect(('8.8.8.8', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+SERVER_IP = get_network_ip()
 def get_startup_config():
+    # Priority 1: Environment Variables (Prevents blocking for EXEs/headless)
+    port_env = os.getenv("MT5_SERVER_PORT")
+    token_env = os.getenv("MT5_API_TOKEN")
+    terminal_env = os.getenv("MT5_TERMINAL_PATH")
+
+    if port_env and token_env:
+        return int(port_env), token_env, terminal_env
+    
+    # Priority 2: Interactive CLI (Fallback if no environment is set)
     print("\n" + "=" * 60)
-    print("      🚀 MT5 Data Server v2.5 — Configuration Startup")
+    print("      🚀 MT5 Data Server v2.6 — Configuration Startup")
     print("=" * 60 + "\n")
 
     default_port = os.getenv("MT5_SERVER_PORT", "5000")
@@ -421,9 +452,9 @@ if __name__ == '__main__':
     else:
         print(f"⚠️  Manual MT5 initialization required (Call /initialize via API)")
 
-    print(f"\n🚀 Server starting on http://localhost:{PORT}")
+    print(f"\n🚀 API Server starting on http://{SERVER_IP}:{PORT}")
     print(f"🔑 Security Token ACTIVE: {MT5_API_TOKEN}")
-    print("\n  Swagger UI:   /docs")
+    print(f"📜 Docs (Swagger UI): http://{SERVER_IP}:{PORT}/docs")
     print("=" * 60 + "\n")
 
     # Clean Port Disposal Handler

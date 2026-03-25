@@ -9,7 +9,7 @@ import pytz
 import requests
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # -----------------------------------------------------------------------
 # Config
@@ -232,33 +232,50 @@ def ping_mt5_server(server_url: str, mt5_token: str = "") -> dict:
 def get_gap_info(df):
     """
     Calculates the gap between the last candle in the dataframe and now.
-    Uses UTC for Cloud safety.
     """
+    import math
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return {"gap_hours": 0, "label": "No Data", "is_fresh": False}
+        return {"gap_hours": 0, "label": "Empty Dataset", "is_fresh": False, "last_timestamp": None}
     
     try:
-        # Find time column flexibly
         time_col = next((c for c in df.columns if c.lower() in ("time", "timestamp", "date")), None)
-        if not time_col: return {"gap_hours": 0, "label": "Invalid Format", "is_fresh": False}
+        if not time_col: 
+            return {"gap_hours": 0, "label": "Invalid Format", "is_fresh": False, "last_timestamp": None}
 
-        # Force UTC conversion
+        # Last candle timestamp
         last_time = pd.to_datetime(df[time_col].iloc[-1], utc=True)
+        if pd.isna(last_time):
+            return {"gap_hours": 9999, "label": "NaT Error", "is_fresh": False, "last_timestamp": None}
+
         now = datetime.now(timezone.utc)
-        
         diff = now - last_time
         gap_hours = diff.total_seconds() / 3600
         
+        # Comprehensive check for NaN or Inf
+        if not math.isfinite(gap_hours):
+            return {"gap_hours": 9999, "label": "Time Error", "is_fresh": False, "last_timestamp": last_time}
+
         is_fresh = gap_hours < 0.25 # 15 min freshness
         
-        if gap_hours < 1: label = "Up to date"
-        elif gap_hours < 24: label = f"{int(gap_hours)} hours ago"
-        else: label = f"{int(gap_hours/24)} days ago"
-        
-        return {"gap_hours": gap_hours, "label": label, "last_time": last_time, "is_fresh": is_fresh}
+        # Build Label safely
+        if gap_hours < 1: 
+            label = "Up to date"
+        elif gap_hours < 24: 
+            label = f"{int(gap_hours)} hours ago"
+        elif gap_hours < 8760: # up to 1 year
+            label = f"{int(gap_hours/24)} days ago"
+        else:
+            label = "Old data"
+            
+        return {
+            "gap_hours": float(gap_hours), 
+            "label": label, 
+            "last_timestamp": last_time, 
+            "is_fresh": is_fresh
+        }
     except Exception as e:
-        print(f"DEBUG: Gap check error: {e}")
-        return {"gap_hours": 0, "label": "Clock error", "is_fresh": False}
+        print(f"DEBUG: Critical Gap check error: {e}")
+        return {"gap_hours": 9999, "label": "Sync Error", "is_fresh": False, "last_timestamp": None}
 def sync_yahoo_symbol(repo_id: str, symbol: str, hf_token: str,
                       existing_df: pd.DataFrame = None) -> tuple[pd.DataFrame, dict]:
     """
@@ -435,3 +452,55 @@ def sync_yahoo_symbol(repo_id: str, symbol: str, hf_token: str,
         "total_rows": len(full_df),
         "filename": target_filename,
     }
+# -----------------------------------------------------------------------
+# 9. Direct Live Fetch (For Real-time Monitoring / Live Tab)
+# -----------------------------------------------------------------------
+def pull_mt5_window(server_url: str, symbol: str, timeframe: str = "1m", 
+                    count: int = 500, token: str = "") -> pd.DataFrame:
+    """
+    Directly pulls the last X candles from MT5 for the Live Feed Tab.
+    Does not touch Hugging Face. Pure broker source.
+    """
+    try:
+        # We'll use the 'FetchData' endpoint with a relative range
+        # Or even better, just use the 'today' or 'last_24h' preset
+        now = datetime.now(timezone.utc)
+        
+        # Estimate how far back based on count and timeframe
+        # TF minutes: 1m=1, 5m=5, etc.
+        tf_mins = 1
+        tf_str = str(timeframe)
+        if tf_str.endswith('m'): tf_mins = int(tf_str[:-1]) if len(tf_str) > 1 else 1
+        elif tf_str.endswith('h'): tf_mins = int(tf_str[:-1]) * 60 if len(tf_str) > 1 else 60
+        elif tf_str.endswith('d'): tf_mins = 1440
+        
+        start_time = now - timedelta(minutes=(count * tf_mins) + 60) # +Buffer
+        
+        payload = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "start_date": start_time.isoformat(),
+            "end_date": now.isoformat()
+        }
+        
+        headers = {"X-MT5-Token": token}
+        resp = requests.post(f"{server_url.rstrip('/')}/data/fetch", json=payload, headers=headers, timeout=10)
+        
+        if resp.status_code != 200:
+            return pd.DataFrame()
+            
+        data = resp.json()
+        if not data.get("success"):
+            return pd.DataFrame()
+            
+        df = pd.DataFrame(data["data"])
+        if df.empty:
+            return df
+            
+        # Ensure 'time' is typed
+        df['time'] = pd.to_datetime(df['time'], utc=True)
+        return df.tail(count).reset_index(drop=True)
+        
+    except Exception as e:
+        print(f"DEBUG: pull_mt5_window error: {e}")
+        return pd.DataFrame()

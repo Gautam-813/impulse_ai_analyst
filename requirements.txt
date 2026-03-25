@@ -24,3 +24,4 @@ streamlit-autorefresh
 yfinance
 ccxt
 toml
+mplfinance
