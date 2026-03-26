@@ -49,7 +49,7 @@ def execute_generated_code(code, df):
         except Exception as e:
             return output.getvalue(), str(e)
 
-def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_key="messages", base_url=None):
+def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_key="messages", base_url=None, snapshot=None):
     """Handles professional quantitative analysis queries using multi-modal AI reasoning."""
     if "messages_live" not in st.session_state: st.session_state.messages_live = []
     if "messages" not in st.session_state: st.session_state.messages = []
@@ -113,6 +113,7 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
                 msg_to_store = {"role": "assistant", "content": full_txt}
                 if final_code: msg_to_store["code"] = final_code
                 if final_stdout: msg_to_store["exec_result"] = final_stdout
+                if snapshot is not None: msg_to_store["snapshot"] = snapshot
                 history.append(msg_to_store)
                 st.rerun()
 
@@ -856,35 +857,61 @@ elif "Live" in view_mode:
         with st_col3: l_count = st.number_input("Lookback Bars", value=500, min_value=100, max_value=5000, step=100, key="l_count")
         with st_col4: 
             st.write("")
-            live_active = st.toggle("Enable Continuous Feed 📡", value=False)
+            live_active = st.toggle("Enable Continuous Feed 📡", value=st.session_state.get("live_active_state", False), key="live_active_sync")
+            st.session_state.live_active_state = live_active
 
-        if st.button("🔄 Start/Sync Live Feed") or live_active:
-            m_url = st.session_state.get("live_mt5_url", "http://localhost:5000")
-            m_tok = st.session_state.get("live_mt5_token", st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026"))
-            if live_active: st_autorefresh(interval=60 * 1000, key="live_refresh")
+        # 🎯 SURGICAL FRAGMENT: Re-runs only the Chart area
+        @st.fragment(run_every=60 if live_active else None)
+        def live_chart_fragment(symbol, timeframe, count, active):
+            m_url = st.session_state.get("mt5_url", "http://localhost:5000")
+            m_tok = st.secrets.get("MT5_API_TOKEN", "impulse_secure_2026")
             
-            with st.spinner("Streaming..."):
-                df_l = pull_mt5_latest(m_url, l_sym, l_tf, l_count, m_tok)
-                if not df_l.empty:
-                    st.session_state.df_live = df_l
-                    st.toast(f"📈 {l_sym} Live Updated: {df_l['time'].iloc[-1].strftime('%H:%M:%S')}")
+            # Fetch directly inside fragment
+            df_l = pull_mt5_latest(m_url, symbol, timeframe, count, m_tok)
+            if not df_l.empty:
+                st.session_state.df_live = df_l
+                
+                # Pulse Bar UI
+                st.subheader(f"📊 {symbol} — {timeframe} Real-Time Feed")
+                last_bar = df_l.iloc[-1]
+                t_str = last_bar['time'].strftime('%H:%M:%S') if hasattr(last_bar['time'], 'strftime') else str(last_bar['time'])
+                
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric("⏲️ Terminal Time", t_str)
+                m2.metric("🟢 OPEN", f"{last_bar['open']:.5f}")
+                m3.metric("📈 HIGH", f"{last_bar['high']:.5f}", delta=f"{(last_bar['high']-last_bar['open']):.5f}")
+                m4.metric("📉 LOW",  f"{last_bar['low']:.5f}",  delta=f"{(last_bar['low']-last_bar['open']):.5f}")
+                m5.metric("🎯 CURRENT", f"{last_bar['close']:.5f}", delta=f"{(last_bar['close']-last_bar['open']):.5f}")
 
+                # Plotly Chart
+                fig = go.Figure(data=[go.Candlestick(x=df_l['time'], open=df_l['open'], high=df_l['high'], low=df_l['low'], close=df_l['close'])])
+                fig.update_layout(template="plotly_dark", height=500, margin=dict(l=10,r=10,t=10,b=10), showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+
+        # Trigger Fragment
+        live_chart_fragment(l_sym, l_tf, l_count, live_active)
+
+        # 🤖 LIVE AI ANALYSIS (Independent Area)
         if st.session_state.get("df_live") is not None:
-            live_df = st.session_state.df_live
-            fig = go.Figure(data=[go.Candlestick(x=live_df['time'], open=live_df['open'], high=live_df['high'], low=live_df['low'], close=live_df['close'])])
-            fig.update_layout(title=f"{l_sym} — {l_tf} Real-Time Feed", template="plotly_dark", height=500, margin=dict(l=10,r=10,t=40,b=10))
-            st.plotly_chart(fig, use_container_width=True)
-            
             st.markdown("---")
             st.subheader("🤖 Live AI Trade Analyst")
+            
             if "messages_live" not in st.session_state: st.session_state.messages_live = []
+            
+            # Historical chat display
             for m in st.session_state.messages_live:
                 with st.chat_message(m["role"]):
                     st.markdown(m["content"])
-                    if "code" in m: execute_generated_code(m["code"], live_df)
+                    if "code" in m:
+                        # Use the snapshot archived with the message if available
+                        msg_df = m.get("snapshot", st.session_state.df_live)
+                        execute_generated_code(m["code"], msg_df)
 
             if chat_l := st.chat_input("Analyze live price action...", key="live_chat"):
-                process_ai_query(chat_l, live_df, model_choice, api_key_to_use, provider_choice, history_key="messages_live", base_url=base_url)
+                # 🛠️ SNAPSHOT MECHANISM: Freeze the data context for this query
+                snapshot_df = st.session_state.df_live.copy()
+                process_ai_query(chat_l, snapshot_df, model_choice, api_key_to_use, provider_choice, 
+                                  history_key="messages_live", base_url=base_url, snapshot=snapshot_df)
     else:
         st.info("📡 Broker Terminal Locked. Please establish the bridge above to stream live market data.")
 
