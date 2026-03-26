@@ -87,7 +87,14 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
             full_txt = ""
             ph = st.empty()
             
-            messages = [{"role": "system", "content": system_prompt}] + history
+            # 🧹 CLEAN HOUSE: Filter out non-serializable data snapshots from the API payload
+            clean_history = []
+            for m in history:
+                # We only send text 'role' and 'content' to the AI.
+                # We do NOT send the raw DataFrame snapshot.
+                clean_history.append({"role": m["role"], "content": m["content"]})
+
+            messages = [{"role": "system", "content": system_prompt}] + clean_history
             
             try:
                 stream = client.chat.completions.create(
@@ -113,7 +120,15 @@ def process_ai_query(prompt, df, model_choice, api_key, model_provider, history_
                 msg_to_store = {"role": "assistant", "content": full_txt}
                 if final_code: msg_to_store["code"] = final_code
                 if final_stdout: msg_to_store["exec_result"] = final_stdout
-                if snapshot is not None: msg_to_store["snapshot"] = snapshot
+                
+                # 🛡️ GOLDEN VAULT: Store snapshot with a unique ID, not inside the message
+                if snapshot is not None:
+                    if "data_vault" not in st.session_state: st.session_state.data_vault = {}
+                    import time
+                    snap_id = f"snap_{int(time.time())}"
+                    st.session_state.data_vault[snap_id] = snapshot
+                    msg_to_store["snapshot_id"] = snap_id
+                
                 history.append(msg_to_store)
                 st.rerun()
 
@@ -903,8 +918,9 @@ elif "Live" in view_mode:
                 with st.chat_message(m["role"]):
                     st.markdown(m["content"])
                     if "code" in m:
-                        # Use the snapshot archived with the message if available
-                        msg_df = m.get("snapshot", st.session_state.df_live)
+                        # 🛡️ VAULT LOOKUP: Retrieve the frozen snapshot using the ID
+                        snap_id = m.get("snapshot_id")
+                        msg_df = st.session_state.get("data_vault", {}).get(snap_id, st.session_state.df_live)
                         execute_generated_code(m["code"], msg_df)
 
             if chat_l := st.chat_input("Analyze live price action...", key="live_chat"):
